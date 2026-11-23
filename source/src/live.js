@@ -112,10 +112,16 @@ export function pcmEncode(planes) {
 export class StreamEncoder {
   constructor(channels, onChunk) {
     this.channels = channels; this.ok = false;
+    // 每送进去 20ms 就出来一包；时间戳按送进去的顺序对应，不用编码器自己算的（它会忽略中间的停顿）
+    this.q = [];
     if (typeof AudioEncoder === 'undefined') return;
     try {
       this.enc = new AudioEncoder({
-        output: (chunk) => { const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d); onChunk(chunk.timestamp / 1000, d); },
+        output: (chunk) => {
+          const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d);
+          const ts = this.q.length ? this.q.shift() : chunk.timestamp / 1000;
+          onChunk(ts, d);
+        },
         error: () => { this.ok = false; },
       });
       this.enc.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: channels, bitrate: channels === 2 ? 160000 : 96000 });
@@ -127,6 +133,8 @@ export class StreamEncoder {
     const n = planes[0].length, data = new Float32Array(n * this.channels);
     planes.forEach((p, c) => data.set(p, c * n));
     const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: n, numberOfChannels: this.channels, timestamp: Math.round(ts * 1000), data });
+    this.q.push(ts);
+    if (this.q.length > 50) this.q.shift(); // 防止异常时无限堆积
     this.enc.encode(ad); ad.close();
     return true;
   }
@@ -146,7 +154,10 @@ export class LiveDecoder {
   }
   opus(ts, payload, ch, src) {
     let dec = this.decs.get(src);
+    // 中间停过（比如重新共享），解码器重建，避免把新声音接在旧时间线后面
+    if (dec && dec.lastTs !== undefined && (ts - dec.lastTs > 300 || ts < dec.lastTs - 300)) { try { dec.close(); } catch {} dec = null; }
     if (!dec || dec.state === 'closed') {
+      const q = [];
       dec = new AudioDecoder({
         output: (ad) => {
           const n = ad.numberOfFrames, buf = this.ctx.createBuffer(ch, n, ad.sampleRate);
@@ -155,15 +166,20 @@ export class LiveDecoder {
             ad.copyTo(tmp, { planeIndex: Math.min(c, ad.numberOfChannels - 1), format: 'f32-planar' });
             buf.copyToChannel(tmp, c);
           }
-          const t = ad.timestamp / 1000;
+          // 时间戳按送进去的顺序对应，不用解码器自己算的
+          const t = q.length ? q.shift() : ad.timestamp / 1000;
           ad.close();
           this.onBuffer(t, buf, src);
         },
         error: () => this.decs.delete(src),
       });
+      dec.q = q;
       dec.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: ch });
       this.decs.set(src, dec);
     }
+    dec.lastTs = ts;
+    dec.q.push(ts);
+    if (dec.q.length > 50) dec.q.shift();
     dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1000), data: payload }));
   }
 }

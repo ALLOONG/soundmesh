@@ -41,11 +41,11 @@ export class Engine extends EventTarget {
     this.cur = null; // { group, plan, pb }
     this.driftTimer = setInterval(() => this.checkDrift(), 1000);
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        if (this.unlocked) this.ctx.resume().catch(() => {});
-        this.sig = null;
-        this.apply();
-      }
+      if (document.visibilityState !== 'visible' || !this.unlocked) return;
+      // 回到前台：只有声音真的被系统暂停了才重新排播放；还在正常播放就不动它（避免每次切回来都断一下）
+      const wasRunning = this.ctx.state === 'running';
+      this.ctx.resume().catch(() => {});
+      if (!wasRunning) { this.sig = null; this.apply(); }
     });
   }
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
@@ -58,6 +58,27 @@ export class Engine extends EventTarget {
     this.unlocked = true;
     this.sig = null;
     this.apply();
+  }
+
+  // 后台播放模式（实验）：把声音改由一个 <audio> 元素播出。手机系统会把它当成“正在播放的媒体”，
+  // 切到别的应用、甚至锁屏后通常也能继续放。代价：多一段系统缓冲，延迟会变大一点，开启后建议重新校准。
+  async setBackgroundMode(on) {
+    if (on === !!this.bgMode) return;
+    try { this.master.disconnect(); } catch {}
+    if (on) {
+      this.bgDest = this.bgDest || this.ctx.createMediaStreamDestination();
+      this.master.connect(this.bgDest);
+      if (!this.bgEl) { this.bgEl = new Audio(); this.bgEl.setAttribute('playsinline', ''); }
+      this.bgEl.srcObject = this.bgDest.stream;
+      try { await this.bgEl.play(); } catch (e) {
+        this.master.disconnect(); this.master.connect(this.ctx.destination);
+        throw e;
+      }
+    } else {
+      try { this.bgEl?.pause(); } catch {}
+      this.master.connect(this.ctx.destination);
+    }
+    this.bgMode = on;
   }
 
   beep() {

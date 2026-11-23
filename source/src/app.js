@@ -384,7 +384,13 @@ const host = {
     this.libSig = null;
     this.changed();
   },
+  resetLivePipeline() {
+    this.sep = null;
+    for (const e of this.encoders.values()) e.close();
+    this.encoders.clear();
+  },
   onLiveState(on) {
+    this.resetLivePipeline(); // 每次开始/停止共享都从干净的状态开始
     if (on) { H.currentGroupId = 'live'; H.playback = { status: 'playing', startServerTime: hostNow(), startOffset: 0 }; }
     else if (H.currentGroupId === 'live') H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
     this.updateOpusWant();
@@ -1105,7 +1111,8 @@ const host = {
     } else if (d.online) {
       badges.push(s.unlocked ? '<span class="badge ok">🔊 已启用声音</span>' : '<span class="badge warn">等待点击启用</span>');
       if (!s.synced) badges.push('<span class="badge warn">时钟同步中</span>');
-      if (s.hidden) badges.push('<span class="badge bad">⚠️ 切到后台/锁屏了</span>');
+      if (s.hidden) badges.push(s.bg ? '<span class="badge warn">在后台（后台播放模式）</span>' : '<span class="badge bad">⚠️ 切到后台/锁屏了</span>');
+      else if (s.bg) badges.push('<span class="badge">后台播放模式</span>');
       if (s.via === 'backup') badges.push('<span class="badge">备用通道</span>');
       badges.push(s.loading ? `<span class="badge warn">下载音频 ${s.dl ?? 0}%</span>` : s.ready ? '<span class="badge ok">就绪</span>' : '');
       if (s.error) badges.push(`<span class="badge bad" title="${esc(s.error)}">错误</span>`);
@@ -1213,6 +1220,7 @@ const node = {
     window.smNode = this;
     try { await this.engine.unlock(); } catch { this.engine.error = '无法启用声音，请再点一次页面'; }
     this.keepAwake();
+    if (store.get('sm-bg', false)) this.engine.setBackgroundMode(true).catch(() => store.set('sm-bg', false));
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') this.keepAwake(); this.sendStats(); });
     $('#overlay').remove();
     this.engine.addEventListener('status', () => this.render());
@@ -1341,7 +1349,7 @@ const node = {
         out: Math.round((e.ctx.outputLatency || e.ctx.baseLatency || 0) * 1000),
         drift: isLive ? (e.liveStats.err === null ? null : r1(e.liveStats.err)) : e.drift === null ? null : r1(e.drift),
         unlocked: e.unlocked && e.ctx.state === 'running', synced: this.clock.synced,
-        hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via,
+        hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via, bg: !!e.bgMode,
         ready: li.loaded === li.needed, loading: li.loaded < li.needed, dl: this.dlPercent(),
         live: isLive ? { got: e.liveStats.got, late: e.liveStats.late } : null,
         error: e.error ? String(e.error).slice(0, 100) : null,
@@ -1426,3 +1434,12 @@ $('#rename').onclick = async () => {
   if (v && v.trim()) { node.name = v.trim().slice(0, 24); store.set('sm-name', node.name); node.setSelf({ name: node.name }); }
 };
 $('#testBeep').onclick = () => node.engine?.beep();
+$('#bgMode').checked = store.get('sm-bg', false);
+$('#bgMode').onchange = async (e) => {
+  const on = e.target.checked;
+  store.set('sm-bg', on);
+  if (!node.engine) return;
+  try { await node.engine.setBackgroundMode(on); toast(on ? '已开启后台播放：可以切到别的应用了。延迟可能变了，建议重新做一次自动校准' : '已关闭后台播放'); }
+  catch { e.target.checked = false; store.set('sm-bg', false); toast('这个浏览器不允许后台播放'); }
+  node.sendStats();
+};

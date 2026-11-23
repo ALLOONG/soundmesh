@@ -364,6 +364,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
           <input type="range" id="lat" min="-500" max="500" step="5" value="0" />
           <div class="muted small">声音比别的设备慢（比如连了蓝牙音箱）→ 往左调；快 → 往右调。</div>
         </div>
+        <label class="small" style="display:flex;align-items:flex-start;gap:8px"><input type="checkbox" id="bgMode" style="margin-top:3px" /><span>允许切到其他应用时继续播放（实验功能）<br /><span class="muted">开启后声音改走系统媒体通道，切到后台通常也不会断；延迟会变一点，开启后请在控制端重新“自动校准”。</span></span></label>
         <div class="row">
           <button id="rename" class="small">改名</button>
           <button id="testBeep" class="small">本机试音</button>
@@ -3551,11 +3552,11 @@ class Engine extends EventTarget {
     this.cur = null; // { group, plan, pb }
     this.driftTimer = setInterval(() => this.checkDrift(), 1000);
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        if (this.unlocked) this.ctx.resume().catch(() => {});
-        this.sig = null;
-        this.apply();
-      }
+      if (document.visibilityState !== 'visible' || !this.unlocked) return;
+      // 回到前台：只有声音真的被系统暂停了才重新排播放；还在正常播放就不动它（避免每次切回来都断一下）
+      const wasRunning = this.ctx.state === 'running';
+      this.ctx.resume().catch(() => {});
+      if (!wasRunning) { this.sig = null; this.apply(); }
     });
   }
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
@@ -3568,6 +3569,27 @@ class Engine extends EventTarget {
     this.unlocked = true;
     this.sig = null;
     this.apply();
+  }
+
+  // 后台播放模式（实验）：把声音改由一个 <audio> 元素播出。手机系统会把它当成“正在播放的媒体”，
+  // 切到别的应用、甚至锁屏后通常也能继续放。代价：多一段系统缓冲，延迟会变大一点，开启后建议重新校准。
+  async setBackgroundMode(on) {
+    if (on === !!this.bgMode) return;
+    try { this.master.disconnect(); } catch {}
+    if (on) {
+      this.bgDest = this.bgDest || this.ctx.createMediaStreamDestination();
+      this.master.connect(this.bgDest);
+      if (!this.bgEl) { this.bgEl = new Audio(); this.bgEl.setAttribute('playsinline', ''); }
+      this.bgEl.srcObject = this.bgDest.stream;
+      try { await this.bgEl.play(); } catch (e) {
+        this.master.disconnect(); this.master.connect(this.ctx.destination);
+        throw e;
+      }
+    } else {
+      try { this.bgEl?.pause(); } catch {}
+      this.master.connect(this.ctx.destination);
+    }
+    this.bgMode = on;
   }
 
   beep() {
@@ -4298,10 +4320,16 @@ function pcmEncode(planes) {
 class StreamEncoder {
   constructor(channels, onChunk) {
     this.channels = channels; this.ok = false;
+    // 每送进去 20ms 就出来一包；时间戳按送进去的顺序对应，不用编码器自己算的（它会忽略中间的停顿）
+    this.q = [];
     if (typeof AudioEncoder === 'undefined') return;
     try {
       this.enc = new AudioEncoder({
-        output: (chunk) => { const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d); onChunk(chunk.timestamp / 1000, d); },
+        output: (chunk) => {
+          const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d);
+          const ts = this.q.length ? this.q.shift() : chunk.timestamp / 1000;
+          onChunk(ts, d);
+        },
         error: () => { this.ok = false; },
       });
       this.enc.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: channels, bitrate: channels === 2 ? 160000 : 96000 });
@@ -4313,6 +4341,8 @@ class StreamEncoder {
     const n = planes[0].length, data = new Float32Array(n * this.channels);
     planes.forEach((p, c) => data.set(p, c * n));
     const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: n, numberOfChannels: this.channels, timestamp: Math.round(ts * 1000), data });
+    this.q.push(ts);
+    if (this.q.length > 50) this.q.shift(); // 防止异常时无限堆积
     this.enc.encode(ad); ad.close();
     return true;
   }
@@ -4332,7 +4362,10 @@ class LiveDecoder {
   }
   opus(ts, payload, ch, src) {
     let dec = this.decs.get(src);
+    // 中间停过（比如重新共享），解码器重建，避免把新声音接在旧时间线后面
+    if (dec && dec.lastTs !== undefined && (ts - dec.lastTs > 300 || ts < dec.lastTs - 300)) { try { dec.close(); } catch {} dec = null; }
     if (!dec || dec.state === 'closed') {
+      const q = [];
       dec = new AudioDecoder({
         output: (ad) => {
           const n = ad.numberOfFrames, buf = this.ctx.createBuffer(ch, n, ad.sampleRate);
@@ -4341,15 +4374,20 @@ class LiveDecoder {
             ad.copyTo(tmp, { planeIndex: Math.min(c, ad.numberOfChannels - 1), format: 'f32-planar' });
             buf.copyToChannel(tmp, c);
           }
-          const t = ad.timestamp / 1000;
+          // 时间戳按送进去的顺序对应，不用解码器自己算的
+          const t = q.length ? q.shift() : ad.timestamp / 1000;
           ad.close();
           this.onBuffer(t, buf, src);
         },
         error: () => this.decs.delete(src),
       });
+      dec.q = q;
       dec.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: ch });
       this.decs.set(src, dec);
     }
+    dec.lastTs = ts;
+    dec.q.push(ts);
+    if (dec.q.length > 50) dec.q.shift();
     dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1000), data: payload }));
   }
 }
@@ -4740,7 +4778,13 @@ const host = {
     this.libSig = null;
     this.changed();
   },
+  resetLivePipeline() {
+    this.sep = null;
+    for (const e of this.encoders.values()) e.close();
+    this.encoders.clear();
+  },
   onLiveState(on) {
+    this.resetLivePipeline(); // 每次开始/停止共享都从干净的状态开始
     if (on) { H.currentGroupId = 'live'; H.playback = { status: 'playing', startServerTime: hostNow(), startOffset: 0 }; }
     else if (H.currentGroupId === 'live') H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
     this.updateOpusWant();
@@ -5461,7 +5505,8 @@ const host = {
     } else if (d.online) {
       badges.push(s.unlocked ? '<span class="badge ok">🔊 已启用声音</span>' : '<span class="badge warn">等待点击启用</span>');
       if (!s.synced) badges.push('<span class="badge warn">时钟同步中</span>');
-      if (s.hidden) badges.push('<span class="badge bad">⚠️ 切到后台/锁屏了</span>');
+      if (s.hidden) badges.push(s.bg ? '<span class="badge warn">在后台（后台播放模式）</span>' : '<span class="badge bad">⚠️ 切到后台/锁屏了</span>');
+      else if (s.bg) badges.push('<span class="badge">后台播放模式</span>');
       if (s.via === 'backup') badges.push('<span class="badge">备用通道</span>');
       badges.push(s.loading ? `<span class="badge warn">下载音频 ${s.dl ?? 0}%</span>` : s.ready ? '<span class="badge ok">就绪</span>' : '');
       if (s.error) badges.push(`<span class="badge bad" title="${esc(s.error)}">错误</span>`);
@@ -5569,6 +5614,7 @@ const node = {
     window.smNode = this;
     try { await this.engine.unlock(); } catch { this.engine.error = '无法启用声音，请再点一次页面'; }
     this.keepAwake();
+    if (store.get('sm-bg', false)) this.engine.setBackgroundMode(true).catch(() => store.set('sm-bg', false));
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') this.keepAwake(); this.sendStats(); });
     $('#overlay').remove();
     this.engine.addEventListener('status', () => this.render());
@@ -5697,7 +5743,7 @@ const node = {
         out: Math.round((e.ctx.outputLatency || e.ctx.baseLatency || 0) * 1000),
         drift: isLive ? (e.liveStats.err === null ? null : r1(e.liveStats.err)) : e.drift === null ? null : r1(e.drift),
         unlocked: e.unlocked && e.ctx.state === 'running', synced: this.clock.synced,
-        hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via,
+        hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via, bg: !!e.bgMode,
         ready: li.loaded === li.needed, loading: li.loaded < li.needed, dl: this.dlPercent(),
         live: isLive ? { got: e.liveStats.got, late: e.liveStats.late } : null,
         error: e.error ? String(e.error).slice(0, 100) : null,
@@ -5782,6 +5828,15 @@ $('#rename').onclick = async () => {
   if (v && v.trim()) { node.name = v.trim().slice(0, 24); store.set('sm-name', node.name); node.setSelf({ name: node.name }); }
 };
 $('#testBeep').onclick = () => node.engine?.beep();
+$('#bgMode').checked = store.get('sm-bg', false);
+$('#bgMode').onchange = async (e) => {
+  const on = e.target.checked;
+  store.set('sm-bg', on);
+  if (!node.engine) return;
+  try { await node.engine.setBackgroundMode(on); toast(on ? '已开启后台播放：可以切到别的应用了。延迟可能变了，建议重新做一次自动校准' : '已关闭后台播放'); }
+  catch { e.target.checked = false; store.set('sm-bg', false); toast('这个浏览器不允许后台播放'); }
+  node.sendStats();
+};
 </script>
 </body>
 </html>
