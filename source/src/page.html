@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SoundMesh 多设备联动音响</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔊</text></svg>" />
+  <meta name="theme-color" content="#0f1115" />
+  <style>/*STYLE*/</style>
+</head>
+<body>
+  <!-- ========== 首页 ========== -->
+  <main class="landing" id="landing">
+    <div class="logo">🔊 SoundMesh</div>
+    <p class="muted">把电脑、手机、平板变成一套联动音响。所有设备用浏览器打开这个网页，一台电脑当控制端，其他当播放节点。可以播放内置演示曲、你的音频文件，或者<b>电脑上正在播放的声音</b>（YouTube Music、Spotify…）。</p>
+    <div id="libErr" class="badge bad" hidden>连接库没有加载出来，请检查网络后刷新</div>
+
+    <div class="card stack">
+      <h3>我是控制端</h3>
+      <p class="muted small">在电脑上创建房间（要共享电脑声音请用 Chrome 或 Edge）。</p>
+      <button class="primary" id="create" style="width:100%">创建房间</button>
+      <div id="recent" class="small"></div>
+    </div>
+
+    <div class="card stack">
+      <h3>我是播放节点</h3>
+      <p class="muted small">扫控制端的二维码，或输入 6 位房间码。</p>
+      <input type="text" id="code" maxlength="6" placeholder="房间码" autocapitalize="characters" autocomplete="off" />
+      <button id="join" style="width:100%">加入房间</button>
+      <div id="err" class="small" style="color:var(--bad)"></div>
+    </div>
+  </main>
+
+  <!-- ========== 控制端 ========== -->
+  <div class="host" id="hostView" hidden>
+    <header>
+      <div>
+        <div class="muted small">房间码</div>
+        <div class="code" id="hCode">----</div>
+      </div>
+      <div class="joinbox">
+        <div class="qr" id="qrBox"></div>
+        <div class="stack small">
+          <div>手机扫码，或打开链接：</div>
+          <div class="row"><code id="joinUrl"></code><button class="small" id="copy">复制</button></div>
+        </div>
+      </div>
+      <span class="grow"></span>
+      <div class="stack small" style="text-align:right">
+        <div id="hConn" class="badge">连接中…</div>
+        <button id="selfNode" class="small">🔈 本机也出声</button>
+      </div>
+    </header>
+
+    <div class="stage">
+      <div class="row small muted" style="margin-bottom:6px">
+        <span>拖动设备摆放位置，👑 是听众位（甜点）。画布上方是“前方”。</span>
+        <span class="grow"></span>
+        <button class="small" id="arc">设备排成弧形</button>
+      </div>
+      <svg id="canvas"></svg>
+    </div>
+
+    <aside>
+      <section class="card stack">
+        <h2>🎵 播放</h2>
+        <div id="library"></div>
+        <details>
+          <summary class="small">＋ 添加音频文件</summary>
+          <div class="stack small" style="margin-top:8px">
+            <div class="muted">选 1 个文件 = 普通曲目（立体声或多声道）；一次选多个文件 = 一组分轨（人声/鼓/贝斯/其他，长度要一致）。推荐 MP3 / M4A / WAV。文件只存在这台电脑的浏览器里，各设备直接从这台电脑下载。</div>
+            <input type="file" id="files" accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg" multiple />
+            <input type="text" id="groupName" placeholder="曲目名称（可选）" />
+            <button class="primary" id="upload">添加</button>
+            <div id="upMsg"></div>
+          </div>
+        </details>
+        <div id="fileTransport" class="stack">
+        <div class="row">
+          <div class="transport">
+            <button id="play" class="primary">▶ 播放</button>
+            <button id="pause">❚❚ 暂停</button>
+            <button id="stop">■ 停止</button>
+          </div>
+          <span class="grow"></span>
+          <span id="time" class="small">0:00</span>
+        </div>
+        <input type="range" id="seek" min="0" max="100" step="0.1" value="0" />
+        </div>
+        <div id="livePanel" class="stack small" hidden>
+          <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
+          <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
+          <div id="liveStatus" class="muted">未在共享</div>
+          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="300" max="2500" step="50" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <label><input type="checkbox" id="opusOn" /> 压缩传输（Opus，省流量；不支持的设备自动用无损）</label>
+          <div class="muted">
+            点按钮后会弹出“共享”窗口：<br />
+            · 在<b>标签页</b>里选正在放 YouTube Music 的网页，并打开“<b>同时共享标签页音频</b>”；<br />
+            · 或选<b>整个屏幕</b>并打开“<b>同时共享系统音频</b>”（Spotify 等桌面软件用这个）。<br />
+            各设备会比电脑晚“缓冲延迟”这么多出声：听音乐没影响；看视频请把电脑本身静音。卡顿就把缓冲调大。
+          </div>
+        </div>
+        <div class="row small"><span>总音量</span><input type="range" id="master" min="0" max="1.5" step="0.01" class="grow" style="width:auto" /><span id="masterVal"></span></div>
+        <div id="ready" class="small muted"></div>
+      </section>
+
+      <section class="card stack">
+        <h2>🧭 模式与规则</h2>
+        <div class="seg" id="modeSeg">
+          <button data-mode="sync">a) 协同播放</button>
+          <button data-mode="split">b) 声音分工</button>
+        </div>
+        <div class="stack small">
+          <label><input type="checkbox" data-opt="distanceGain" /> 按距离补偿音量</label>
+          <div class="row" style="padding-left:24px">
+            <select id="gainPreset">
+              <option value="balanced">平衡：听众位各设备一样响</option>
+              <option value="focus">聚焦：离听众越近越响</option>
+            </select>
+          </div>
+          <label><input type="checkbox" data-opt="distanceDelay" /> 按距离补偿延迟（声音同时到达听众位）</label>
+          <label><input type="checkbox" data-opt="stereo" /> 按方位分配左右声道</label>
+          <div class="row" style="padding-left:24px"><span>立体声宽度</span><input type="range" id="width" min="0" max="1" step="0.05" class="grow" style="width:auto" /></div>
+        </div>
+        <div id="splitBox" class="stack small">
+          <div class="row"><span>分工方式</span>
+            <select id="splitPreset">
+              <option value="auto">自动（分轨→按轨道，多声道→按声道，否则按频段）</option>
+              <option value="stems">按分轨（人声/鼓/贝斯…）</option>
+              <option value="channels">按声道（5.1 等多声道文件）</option>
+              <option value="bands">按频段（低/中/高）</option>
+            </select>
+          </div>
+          <div class="row"><span>分频点</span>低 <input type="number" id="lowCut" min="40" max="1000" step="10" /> Hz · 高 <input type="number" id="highCut" min="500" max="12000" step="100" /> Hz</div>
+          <div class="muted">自动规则：人声/旋律→最靠正前方的设备；贝斯/低频/LFE→标了“低音强”的设备（没标就选电脑）；其余从左到右分。设备卡片里可以锁定并手动绑定。</div>
+        </div>
+        <div class="row small"><span>房间尺寸</span><input type="number" id="roomW" min="1" max="50" step="0.5" /> × <input type="number" id="roomH" min="1" max="50" step="0.5" /> 米</div>
+      </section>
+
+      <section class="stack">
+        <h2 style="padding:0 4px">📡 设备 <span id="devCount" class="muted"></span></h2>
+        <div id="devices" class="stack"></div>
+        <div id="noDev" class="card muted small">还没有设备加入。让手机扫上面的二维码。</div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- ========== 播放节点 ========== -->
+  <div id="nodeView" hidden>
+    <div class="overlay" id="overlay">
+      <div class="card stack">
+        <div style="font-size:40px">🔊</div>
+        <h2 style="color:var(--text);font-size:20px">加入房间 <span id="nCodeTitle"></span></h2>
+        <p class="muted small">请和控制端电脑连在同一个 Wi-Fi 或热点下，连接最稳定。</p>
+        <input type="text" id="name" maxlength="24" placeholder="给这台设备起个名字" style="width:100%;text-align:center" />
+        <button class="primary go" id="go">点我加入并启用声音</button>
+        <p class="muted small">浏览器规定必须点一下才能出声。<br />iPhone 请关掉侧边静音键；播放时请保持本页面在前台、屏幕常亮。</p>
+      </div>
+    </div>
+    <main class="node" id="nodeMain">
+      <div class="muted small" id="roomLine"></div>
+      <div class="bigname" id="bigname">…</div>
+      <div class="assign" id="assign">等待控制端</div>
+      <div class="meter"><div id="vol"></div></div>
+      <div class="small" id="pbLine" style="margin-bottom:14px"></div>
+      <div class="panel stack" style="margin-top:12px">
+        <dl class="kv" id="stats"></dl>
+        <div>
+          <div class="row small"><span class="grow">延迟微调（本机）</span><b id="latVal">0 ms</b></div>
+          <input type="range" id="lat" min="-500" max="500" step="5" value="0" />
+          <div class="muted small">声音比别的设备慢（比如连了蓝牙音箱）→ 往左调；快 → 往右调。</div>
+        </div>
+        <div class="row">
+          <button id="rename" class="small">改名</button>
+          <button id="testBeep" class="small">本机试音</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="modal" class="overlay" hidden style="background:#000a;z-index:20">
+    <div class="card stack" style="text-align:left">
+      <div id="modalMsg"></div>
+      <input type="text" id="modalInput" style="width:100%" hidden />
+      <div class="row"><span class="grow"></span><button id="modalCancel">取消</button><button id="modalOk" class="primary">确定</button></div>
+    </div>
+  </div>
+
+  <script>/*VENDOR*/</script>
+  <script type="module">/*SCRIPT*/</script>
+</body>
+</html>
