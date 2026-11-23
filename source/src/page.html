@@ -6,6 +6,11 @@
   <title>SoundMesh 多设备联动音响</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔊</text></svg>" />
   <meta name="theme-color" content="#0f1115" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="SoundMesh" />
   <style>/*STYLE*/</style>
 </head>
 <body>
@@ -165,6 +170,20 @@
           <div class="row"><span>分频点</span>低 <input type="number" id="lowCut" min="40" max="1000" step="10" /> Hz · 高 <input type="number" id="highCut" min="500" max="12000" step="100" /> Hz</div>
           <div class="muted">自动规则：人声/旋律→最靠正前方的设备；贝斯/低频/LFE→标了“低音强”的设备（没标就选电脑）；其余从左到右分。设备卡片里可以锁定并手动绑定。</div>
         </div>
+        <div class="stack small">
+          <div class="row"><span>🌀 移动音效</span>
+            <select id="motionType" class="grow">
+              <option value="off">关闭</option>
+              <option value="circle">环绕：声音绕着听众转圈</option>
+              <option value="pingpong">扫射：声音从左到右来回移动</option>
+            </select>
+          </div>
+          <div id="motionOpts" class="stack">
+            <div class="row"><span>速度</span><input type="range" id="motionSpeed" min="2" max="30" step="1" class="grow" style="width:auto" /><span id="motionSpeedVal"></span></div>
+            <div class="row"><span>强度</span><input type="range" id="motionDepth" min="0.3" max="1" step="0.05" class="grow" style="width:auto" /><span id="motionDepthVal"></span></div>
+            <div class="muted">画布上紫色的 🔊 是“虚拟声源”，离它越近的设备越响。设备分散摆在听众周围效果最明显（前后左右都有更好）。</div>
+          </div>
+        </div>
         <div class="row small"><span>房间尺寸</span><input type="number" id="roomW" min="1" max="50" step="0.5" /> × <input type="number" id="roomH" min="1" max="50" step="0.5" /> 米</div>
       </section>
 
@@ -219,6 +238,7 @@
   </div>
 
   <script>/*VENDOR*/</script>
+  <script>/*TRYSTERO*/</script>
   <script type="module">/*SCRIPT*/</script>
 </body>
 </html>

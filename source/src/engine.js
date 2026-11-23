@@ -5,6 +5,13 @@ import { makeChirp } from './calib.js';
 const DRIFT_LIMIT_MS = 35;
 const START_LEAD_MS = 150;
 
+// 移动音效里虚拟声源在时间 t 的方位角（度，0 = 正前方，正 = 右）
+export function motionAngle(mo, t) {
+  const frac = ((((t - mo.t0) / 1000) / mo.p) % 1 + 1) % 1;
+  if (mo.y === 'pingpong') return -90 + 180 * (frac < 0.5 ? frac * 2 : 2 - frac * 2);
+  return -180 + frac * 360;
+}
+
 export class Engine extends EventTarget {
   constructor(clock, { fetchFile } = {}) {
     super();
@@ -18,7 +25,10 @@ export class Engine extends EventTarget {
     this.master = this.ctx.createGain();
     this.master.connect(this.ctx.destination);
     this.deviceGain = this.ctx.createGain();
-    this.deviceGain.connect(this.master);
+    this.motionGain = this.ctx.createGain(); // 环绕移动音效：在设备增益之后再乘一层随时间变化的增益
+    this.deviceGain.connect(this.motionGain);
+    this.motionGain.connect(this.master);
+    this.motionTimer = setInterval(() => this.tickMotion(), 40);
     this.unlocked = false;
     this.buffers = new Map(); // src -> { promise, buffer, error }
     this.localFiles = new Map(); // 'local:...' -> File
@@ -68,6 +78,24 @@ export class Engine extends EventTarget {
     const g = this.deviceGain.gain;
     g.cancelScheduledValues(t); g.setTargetAtTime(0, t, 0.03);
     g.setTargetAtTime(this.cur?.plan?.gain ?? 1, end, 0.1);
+  }
+
+  // 环绕移动音效：一个“虚拟声源”绕着听众转（circle）或左右来回扫（pingpong），
+  // 离它越近的设备越响。每台设备用自己的方位角和统一时钟独立计算，不需要网络传输每一帧
+  tickMotion() {
+    const mo = this.cur?.mo, az = this.cur?.plan?.az;
+    const g = this.motionGain.gain, t = this.ctx.currentTime;
+    if (!mo || az === undefined || az === null || !this.clock.synced) {
+      if (this.motionOn) { g.cancelScheduledValues(t); g.setTargetAtTime(1, t, 0.1); this.motionOn = false; }
+      return;
+    }
+    this.motionOn = true;
+    const at = this.clock.now() + 80;
+    const th = motionAngle(mo, at);
+    let d = Math.abs(az - th) % 360; if (d > 180) d = 360 - d;
+    const lobe = Math.pow((1 + Math.cos((d * Math.PI) / 180)) / 2, 3);
+    const val = 1 - mo.d + mo.d * lobe;
+    g.setTargetAtTime(val, Math.max(t, this.clockToCtx(at)), 0.05);
   }
 
   // 分工检查：只在 [from, to) 这段时间出声，其余时间（到 end 为止）静音
@@ -357,6 +385,7 @@ export class Engine extends EventTarget {
 
   destroy() {
     clearInterval(this.driftTimer);
+    clearInterval(this.motionTimer);
     this.stopAll();
     this.teardownLive();
     this.ctx.close();

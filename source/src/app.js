@@ -1,8 +1,8 @@
 // SoundMesh 独立网页版：控制端 + 播放节点；设备之间 WebRTC 直连；支持电脑实时音源
 import { computeMix, assignLabel, assignOptions, guessRole } from './mix.js';
-import { Engine } from './engine.js';
+import { Engine, motionAngle } from './engine.js';
 import { BUILTIN_GROUPS } from './synth.js';
-import { HostLink, NodeLink, packBin } from './transport.js';
+import { MultiHostLink, AutoNodeLink, packBin } from './transport.js';
 import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder } from './live.js';
 import { Separator, STEMS, STEM_NAMES } from './separator.js';
 import { searchLyrics, parseLRC, lineAt } from './lyrics.js';
@@ -144,7 +144,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, lyrics: null, ly: { a: null, s: 0, o: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -173,12 +173,12 @@ const host = {
     this.bindUI();
     this.render();
     if (!window.Peer) return this.status('连接库没加载出来，检查网络后刷新', 'bad');
-    this.link = new HostLink(code);
+    this.link = new MultiHostLink(code);
     let tries = 0;
     this.link.addEventListener('status', (e) => {
       const s = e.detail;
       if (s === 'open') this.status('已上线', 'ok');
-      else if (s === 'signal-lost') this.status('信令服务器断开，重连中（已连上的设备不受影响）', 'warn');
+      else if (s === 'signal-lost') this.status(window.Trystero ? '主通道断开，备用通道在线（已连上的设备不受影响）' : '信令服务器断开，重连中（已连上的设备不受影响）', 'warn');
       else if (s === 'taken') {
         // 刚刷新时旧连接可能还没释放，等一下再试；还不行就换个房间码
         if (resume && tries++ < 4) { this.status('房间码被占用，重试中…', 'warn'); setTimeout(() => this.link.restartWithCode(H.code), 3000); }
@@ -219,6 +219,8 @@ const host = {
     if (msg.t === 'hello') {
       const did = c.did;
       if (!did) return;
+      // 同一台设备换了通道重连：旧连接作废，避免收到两份音频
+      for (const o of this.link.clients.values()) if (o !== c && o.did === did) o.did = null;
       c.opus = !!msg.opus;
       let d = H.devices[did];
       if (!d) {
@@ -261,7 +263,7 @@ const host = {
   },
 
   onPeers() {
-    const online = new Set([...this.link.clients.values()].filter((c) => c.did && c.ctl?.open).map((c) => c.did));
+    const online = new Set([...this.link.clients.values()].filter((c) => c.did && this.link.isOpen(c)).map((c) => c.did));
     for (const d of Object.values(H.devices)) if (d.id !== 'self') d.online = online.has(d.id);
     this.updateOpusWant();
     this.changed();
@@ -282,6 +284,10 @@ const host = {
       const buf = await this.getFile(id);
       if (!buf) { this.link.send(c, { t: 'fileErr', id }); return; }
       const total = buf.byteLength, CH = 16000;
+      if (c.via === 'backup') { // 备用通道自带分块和流控：整个文件一次发
+        this.link.sendBin(c, packBin({ k: 'f', id, off: 0, total }, new Uint8Array(buf)));
+        return;
+      }
       for (let off = 0; off < total; off += CH) {
         while (this.link.buffered(c) > 1 << 20) { await sleep(20); if (!c.bin?.open) return; }
         if (!this.link.sendBin(c, packBin({ k: 'f', id, off, total }, new Uint8Array(buf, off, Math.min(CH, total - off))))) return;
@@ -391,7 +397,7 @@ const host = {
   wire(plans) {
     const g = this.group(), pb = H.playback;
     const w = {
-      v: 1, ep: EPOCH, ld: H.liveDelay, ly: H.lyrics ? { id: H.lyrics.id, a: H.ly.a, s: H.ly.s, o: H.ly.o } : null, pb: [PB_CODE[pb.status], Math.round(pb.startServerTime), r3(pb.startOffset)], m: H.mode === 'split' ? 1 : 0,
+      v: 1, ep: EPOCH, ld: H.liveDelay, mo: H.motion.y !== 'off' ? { y: H.motion.y, p: H.motion.p, d: H.motion.d, t0: H.motion.t0 } : null, ly: H.lyrics ? { id: H.lyrics.id, a: H.ly.a, s: H.ly.s, o: H.ly.o } : null, pb: [PB_CODE[pb.status], Math.round(pb.startServerTime), r3(pb.startOffset)], m: H.mode === 'split' ? 1 : 0,
       g: g ? { id: g.id, k: g.kind, n: g.name.slice(0, 60), l: g.loop ? 1 : 0, d: r3(g.duration || 0), t: g.tracks.map((t) => [t.src, t.channels]) } : null,
       p: {},
     };
@@ -400,7 +406,7 @@ const host = {
       const idx = (id) => g.tracks.findIndex((t) => t.id === id);
       w.p[did] = [r3(pl.gain), r1(pl.delayMs), d.latencyMs,
         pl.sources.map((s) => [idx(s.trackId), s.mix.type === 'lr' ? ['l', r3(s.mix.wl), r3(s.mix.wr)] : s.mix.type === 'ch' ? ['c', s.mix.index] : ['s'], s.filters.map((f) => [f.type[0], Math.round(f.freq)])]),
-        (H.mode === 'split' ? pl.assign.map((k) => assignLabel(H, k)).join(' + ') : '协同播放').slice(0, 60), d.color, d.name];
+        (H.mode === 'split' ? pl.assign.map((k) => assignLabel(H, k)).join(' + ') : '协同播放').slice(0, 60), d.color, d.name, Math.round(pl.azimuth)];
     }
     return w;
   },
@@ -492,6 +498,15 @@ const host = {
     $$('#modeSeg button').forEach((b) => (b.onclick = () => { H.mode = b.dataset.mode; this.changed(); }));
     $$('[data-opt]').forEach((c) => (c.onchange = () => { H.options[c.dataset.opt] = c.checked; this.changed(); }));
     $('#gainPreset').onchange = (e) => { H.gainPreset = e.target.value; this.changed(); };
+    const motion = () => {
+      const y = $('#motionType').value;
+      if (y !== H.motion.y) H.motion.t0 = Math.round(hostNow() + 300);
+      H.motion = { ...H.motion, y, p: Number($('#motionSpeed').value), d: Number($('#motionDepth').value) };
+      this.changed();
+    };
+    $('#motionType').onchange = motion; $('#motionSpeed').onchange = motion; $('#motionDepth').onchange = motion;
+    const anim = () => { this.animMotion(); requestAnimationFrame(anim); };
+    requestAnimationFrame(anim);
     $('#splitPreset').onchange = (e) => { H.splitPreset = e.target.value; this.changed(); };
     $('#width').oninput = (e) => { H.stereoWidth = Number(e.target.value); this.changed(); };
     const clampN = (v, a, b, d) => (Number.isFinite(+v) ? Math.min(b, Math.max(a, +v)) : d);
@@ -810,6 +825,14 @@ const host = {
     this.renderLive();
   },
 
+  animMotion() {
+    const dot = document.getElementById('motionDot');
+    if (!dot || H.motion.y === 'off') return;
+    const th = (motionAngle(H.motion, hostNow()) * Math.PI) / 180, R = Math.min(2.2, H.listener.y * 0.85);
+    const x = (H.listener.x + Math.sin(th) * R) * 100, y = (H.listener.y - Math.cos(th) * R) * 100;
+    dot.setAttribute('transform', `translate(${x},${y})`);
+  },
+
   renderTime() {
     const g = this.group(), isLive = g?.kind === 'live';
     $('#fileTransport').hidden = isLive;
@@ -865,6 +888,12 @@ const host = {
     lg.append(el('text', { 'text-anchor': 'middle', y: 9, style: 'font-size:26px' }, '👑'));
     lg.append(el('text', { 'text-anchor': 'middle', y: 50, class: 'sub' }, '听众位'));
     svg.append(lg);
+    if (H.motion.y !== 'off') {
+      const md = el('g', { id: 'motionDot' });
+      md.append(el('circle', { r: 22, fill: '#cc5de855', stroke: '#cc5de8', 'stroke-width': 2 }));
+      md.append(el('text', { 'text-anchor': 'middle', y: 8, style: 'font-size:22px' }, '🔊'));
+      svg.append(md);
+    }
     for (const d of devs) {
       const plan = plans[d.id], r = 28;
       const g = el('g', { class: `dev ${d.online ? '' : 'offline'} ${this.selected === d.id ? 'selected' : ''}`, 'data-drag': 'dev', 'data-id': d.id, transform: `translate(${d.x * U},${d.y * U})` });
@@ -921,7 +950,11 @@ const host = {
     const setVal = (sel, v, prop = 'value') => { const e = $(sel); if (e && document.activeElement !== e) e[prop] = v; };
     $$('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === H.mode));
     $$('[data-opt]').forEach((c) => { if (document.activeElement !== c) c.checked = !!H.options[c.dataset.opt]; });
-    setVal('#gainPreset', H.gainPreset); setVal('#splitPreset', H.splitPreset); setVal('#width', H.stereoWidth);
+    setVal('#gainPreset', H.gainPreset);
+    setVal('#motionType', H.motion.y); setVal('#motionSpeed', H.motion.p); setVal('#motionDepth', H.motion.d);
+    $('#motionSpeedVal').textContent = `${H.motion.p} 秒/圈`;
+    $('#motionDepthVal').textContent = `${Math.round(H.motion.d * 100)}%`;
+    $('#motionOpts').style.display = H.motion.y === 'off' ? 'none' : ''; setVal('#splitPreset', H.splitPreset); setVal('#width', H.stereoWidth);
     setVal('#lowCut', H.bands.lowCut); setVal('#highCut', H.bands.highCut);
     setVal('#roomW', H.size.w); setVal('#roomH', H.size.h); setVal('#master', H.masterVolume);
     $('#masterVal').textContent = Math.round(H.masterVolume * 100) + '%';
@@ -1037,6 +1070,8 @@ const host = {
     } else if (d.online) {
       badges.push(s.unlocked ? '<span class="badge ok">🔊 已启用声音</span>' : '<span class="badge warn">等待点击启用</span>');
       if (!s.synced) badges.push('<span class="badge warn">时钟同步中</span>');
+      if (s.hidden) badges.push('<span class="badge bad">⚠️ 切到后台/锁屏了</span>');
+      if (s.via === 'backup') badges.push('<span class="badge">备用通道</span>');
       badges.push(s.loading ? `<span class="badge warn">下载音频 ${s.dl ?? 0}%</span>` : s.ready ? '<span class="badge ok">就绪</span>' : '');
       if (s.error) badges.push(`<span class="badge bad" title="${esc(s.error)}">错误</span>`);
       const liveTxt = s.live ? ` · 实时：收到 ${s.live.got} 段，迟到 ${s.live.late}` : '';
@@ -1094,13 +1129,13 @@ function decodeWire(w, did) {
   const g = w.g && { id: w.g.id, kind: w.g.k, name: w.g.n, loop: !!w.g.l, duration: w.g.d, tracks: w.g.t.map(([src, ch]) => ({ src, channels: ch })) };
   const pb = { status: PB_NAME[w.pb[0]], S: w.pb[1], o: w.pb[2] };
   const p = w.p[did];
-  const base = { group: g, pb, mode: w.m, ld: w.ld, ly: w.ly };
+  const base = { group: g, pb, mode: w.m, ld: w.ld, ly: w.ly, mo: w.mo };
   if (!p || !g) return { ...base, plan: null };
-  const [gain, posDelay, latency, srcs, label, color, name] = p;
+  const [gain, posDelay, latency, srcs, label, color, name, az] = p;
   return {
     ...base,
     plan: {
-      gain, posDelay, latency, D: posDelay + latency, label, color, name,
+      gain, posDelay, latency, D: posDelay + latency, label, color, name, az,
       sources: srcs.filter(([i]) => g.tracks[i]).map(([i, mix, filters]) => ({
         src: g.tracks[i].src,
         mix: mix[0] === 'l' ? { type: 'lr', wl: mix[1], wr: mix[2] } : mix[0] === 'c' ? { type: 'ch', index: mix[1] } : { type: 'stereo' },
@@ -1142,15 +1177,17 @@ const node = {
     this.engine = new Engine(this.clock, { fetchFile: (id) => this.fetchFile(id) });
     window.smNode = this;
     try { await this.engine.unlock(); } catch { this.engine.error = '无法启用声音，请再点一次页面'; }
+    this.keepAwake();
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') this.keepAwake(); this.sendStats(); });
     $('#overlay').remove();
     this.engine.addEventListener('status', () => this.render());
     this.decoder = new LiveDecoder(this.engine.ctx, (ts, buf, src) => this.engine.pushLive(ts, buf, src));
     if (!window.Peer) { this.err = '连接库没加载出来，检查网络后刷新'; return this.render(); }
     const opus = await opusDecodeSupported();
-    this.link = new NodeLink(code, () => ({ t: 'hello', did: this.did, name: this.name, type: detectDeviceType(), opus }));
+    this.link = new AutoNodeLink(code, () => ({ t: 'hello', did: this.did, name: this.name, type: detectDeviceType(), opus }));
     this.link.addEventListener('status', (e) => {
       const s = e.detail;
-      this.linkStatus = { open: '已连接控制端', connecting: '连接中…', lost: '连接断开，重连中…', 'no-host': '找不到这个房间（控制端没打开或房间码不对），重试中…', 'signal-error': '连不上信令服务器，重试中…' }[s] || s;
+      this.linkStatus = s === 'open' && this.link.via === 'backup' ? '已连接控制端（备用通道）' : { open: '已连接控制端', connecting: '连接中…', fallback: '主通道连不上，正在改走备用通道…', lost: '连接断开，重连中…', 'no-host': '找不到这个房间（控制端没打开或房间码不对），重试中…', 'signal-error': '连不上信令服务器，重试中…' }[s] || s;
       if (s === 'open') { this.clock.reset(); this.burst(16); for (const f of this.files.values()) if (!f.done) this.link.send({ t: 'getFile', id: f.id }); }
       this.render();
     });
@@ -1269,6 +1306,7 @@ const node = {
         out: Math.round((e.ctx.outputLatency || e.ctx.baseLatency || 0) * 1000),
         drift: isLive ? (e.liveStats.err === null ? null : r1(e.liveStats.err)) : e.drift === null ? null : r1(e.drift),
         unlocked: e.unlocked && e.ctx.state === 'running', synced: this.clock.synced,
+        hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via,
         ready: li.loaded === li.needed, loading: li.loaded < li.needed, dl: this.dlPercent(),
         live: isLive ? { got: e.liveStats.got, late: e.liveStats.late } : null,
         error: e.error ? String(e.error).slice(0, 100) : null,
@@ -1277,6 +1315,20 @@ const node = {
   },
 
   setSelf(patch) { this.link?.send({ t: 'self', ...patch }); },
+
+  // 屏幕常亮：锁屏/熄屏后浏览器会暂停声音，所以播放时一直亮着
+  async keepAwake() {
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible' && !this.wake) {
+        this.wake = await navigator.wakeLock.request('screen');
+        this.wake.addEventListener('release', () => { this.wake = null; this.render(); });
+      }
+    } catch { this.wake = null; }
+    if ('mediaSession' in navigator && window.MediaMetadata) {
+      try { navigator.mediaSession.metadata = new MediaMetadata({ title: 'SoundMesh 联动音响', artist: `房间 ${this.code}` }); } catch {}
+    }
+    this.render();
+  },
 
   renderLyrics() {
     const L = this.lyrics, ly = this.cur && decodeLy(this.cur);
@@ -1315,6 +1367,7 @@ const node = {
       ['输出延迟', `${((e.ctx.outputLatency || e.ctx.baseLatency || 0) * 1000).toFixed(0)} ms（浏览器报告值）`],
       ['同步偏差', isLive ? (e.liveStats.err === null ? '—' : `${e.liveStats.err.toFixed(1)} ms`) : e.drift === null ? '—' : `${e.drift.toFixed(1)} ms · 已重新对齐 ${e.resyncs} 次`],
       ['音频状态', `${e.ctx.state} · ${e.ctx.sampleRate} Hz`],
+      ['屏幕常亮', this.wake ? '✅ 已开启' : 'wakeLock' in navigator ? '⚠️ 未开启（点一下页面任意位置）' : '⚠️ 这个浏览器不支持，请在系统设置里把自动锁屏时间调长'],
     ];
     $('#stats').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   },
@@ -1326,7 +1379,12 @@ function startNode(code) {
   $('#nCodeTitle').textContent = code;
   $('#name').value = store.get('sm-name', '') || `${TYPE_NAME[detectDeviceType()]} ${String.fromCharCode(65 + Math.floor(Math.random() * 26))}`;
   $('#go').onclick = () => node.start(code);
+  // 点页面任意位置：重新申请屏幕常亮、恢复声音（浏览器要求由点击触发）
+  $('#nodeMain').addEventListener('click', () => { if (node.engine) { node.keepAwake(); node.engine.ctx.resume().catch(() => {}); } });
 }
+
+// 可以“添加到主屏幕”当 App 用；也能在网络不稳时更快打开
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 $('#lat').oninput = (e) => { $('#latVal').textContent = `${e.target.value} ms`; node.setSelf({ latencyMs: Number(e.target.value) }); };
 $('#rename').onclick = async () => {
   const v = await ask('设备名称', { input: node.name });

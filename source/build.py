@@ -15,6 +15,11 @@ vend = '// PeerJS 1.5.5 (MIT) + qrcode-generator (MIT)\n' + vendor('node_modules
 page = (src / 'page.html').read_text()
 page = page.replace('/*STYLE*/', (src / 'style.css').read_text())
 page = page.replace('/*VENDOR*/', vend)
+page = page.replace('/*TRYSTERO*/', '// Trystero (MIT)\n' + vendor('vendor/trystero.min.js'))
 page = page.replace('/*SCRIPT*/', '\n'.join(js))
 pathlib.Path('../index.html').write_text(page)
 print(len(page), 'bytes')
+
+import shutil
+for f in ['manifest.webmanifest', 'sw.js', 'icon-192.png', 'icon-512.png']:
+    shutil.copy(src / 'pwa' / f, pathlib.Path('..') / f)
