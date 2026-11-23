@@ -66,6 +66,14 @@
       </div>
       <svg id="canvas"></svg>
       <div id="stageLyric" class="ly-strip" hidden></div>
+      <div id="mirrorBox" class="mirror-box" hidden>
+        <canvas id="mirror"></canvas>
+        <div class="row small mirror-bar">
+          <span id="mirrorInfo" class="muted"></span><span class="grow"></span>
+          <span>画面微调</span><input type="range" id="mirrorOffset" min="-500" max="500" step="10" style="width:140px" /><b id="mirrorOffsetVal"></b>
+          <button class="small" id="mirrorFull">⛶ 全屏</button><button class="small" id="mirrorClose">关闭</button>
+        </div>
+      </div>
     </div>
 
     <aside>
@@ -96,9 +104,10 @@
         </div>
         <div id="livePanel" class="stack small" hidden>
           <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
+          <button id="mirrorBtn" style="width:100%">📺 同步画面（看视频时用：画面延后到和手机声音对齐）</button>
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
-          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="3000" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
           <label><input type="checkbox" id="liveStems" /> 🎚 实时拆声部（人声/鼓/贝斯/伴奏，配合“声音分工”按位置分给各设备）</label>
           <label><input type="checkbox" id="pcPlay" /> 电脑也出声（关掉 = 只有手机/平板出声，电脑静音）</label>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>

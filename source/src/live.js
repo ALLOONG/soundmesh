@@ -52,13 +52,14 @@ export class LiveCapture extends EventTarget {
     }
     // 共享的是标签页时，浏览器会把那个标签页在电脑上静音（避免听到比手机早的声音）
     this.surface = stream.getVideoTracks()[0]?.getSettings?.().displaySurface || 'unknown';
-    stream.getVideoTracks().forEach((t) => (t.enabled = false)); // 画面不需要
+
     return this.startFromStream(stream);
   }
 
   async startFromStream(stream) {
     await this.stop();
     this.stream = stream;
+    this.videoTrack = stream.getVideoTracks()[0] || null; // 画面留着给“同步画面”用
     this.ctx = new AudioContext({ sampleRate: SR });
     await this.ctx.resume();
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
@@ -96,7 +97,7 @@ export class LiveCapture extends EventTarget {
     this.running = false;
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
     try { await this.ctx?.close(); } catch {}
-    this.stream = null; this.ctx = null;
+    this.stream = null; this.ctx = null; this.videoTrack = null;
     this.emit('state', false);
   }
 }
@@ -181,5 +182,60 @@ export class LiveDecoder {
     dec.q.push(ts);
     if (dec.q.length > 50) dec.q.shift();
     dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1000), data: payload }));
+  }
+}
+
+
+// 同步画面：把共享的画面延后同样的缓冲时间再显示，和手机放出的声音对齐
+export class VideoMirror {
+  constructor(canvas, getDelayMs) {
+    this.canvas = canvas; this.ctx2d = canvas.getContext('2d'); this.getDelay = getDelayMs;
+    this.q = []; this.running = false;
+  }
+  static supported() { return typeof window.MediaStreamTrackProcessor === 'function'; }
+  start(track) {
+    this.stop();
+    if (!track || !VideoMirror.supported()) return false;
+    this.running = true;
+    this.reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    this.pump();
+    const draw = () => { if (!this.running) return; this.draw(); requestAnimationFrame(draw); };
+    requestAnimationFrame(draw);
+    return true;
+  }
+  async pump() {
+    const reader = this.reader;
+    while (this.running && reader === this.reader) {
+      let r;
+      try { r = await reader.read(); } catch { break; }
+      if (r.done) break;
+      const frame = r.value, t = performance.now();
+      try {
+        // 缩小后转成图片保存，原始画面帧马上释放（采集端的帧数量有限，扣着不放会卡住）
+        const w = Math.min(1280, frame.displayWidth), h = Math.round((frame.displayHeight * w) / frame.displayWidth);
+        const bmp = await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' });
+        this.q.push({ t, bmp });
+      } catch {}
+      frame.close();
+      while (this.q.length > 150) this.q.shift().bmp.close(); // 最多存约 5 秒
+    }
+  }
+  draw() {
+    const due = performance.now() - this.getDelay();
+    let pick = null;
+    while (this.q.length && this.q[0].t <= due) { if (pick) pick.bmp.close(); pick = this.q.shift(); }
+    if (!pick) return;
+    const { bmp } = pick, c = this.canvas;
+    if (c.width !== bmp.width || c.height !== bmp.height) { c.width = bmp.width; c.height = bmp.height; }
+    this.ctx2d.drawImage(bmp, 0, 0);
+    this.last?.bmp.close();
+    this.last = pick;
+  }
+  stop() {
+    this.running = false;
+    try { this.reader?.cancel(); } catch {}
+    this.reader = null;
+    for (const x of this.q) x.bmp.close();
+    this.q = [];
   }
 }

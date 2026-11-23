@@ -157,6 +157,11 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
 
 #canvas line, #canvas circle, #canvas rect { vector-effect: non-scaling-stroke; }
 #canvas .grid line.major { stroke: #2d3442; }
+
+.mirror-box { position: absolute; inset: 14px; background: #000; border-radius: 12px; display: flex; flex-direction: column; z-index: 4; overflow: hidden; }
+.mirror-box canvas { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
+.mirror-bar { padding: 8px 10px; background: #111a; }
+.mirror-box:fullscreen { inset: 0; border-radius: 0; }
 </style>
 </head>
 <body>
@@ -212,6 +217,14 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
       </div>
       <svg id="canvas"></svg>
       <div id="stageLyric" class="ly-strip" hidden></div>
+      <div id="mirrorBox" class="mirror-box" hidden>
+        <canvas id="mirror"></canvas>
+        <div class="row small mirror-bar">
+          <span id="mirrorInfo" class="muted"></span><span class="grow"></span>
+          <span>画面微调</span><input type="range" id="mirrorOffset" min="-500" max="500" step="10" style="width:140px" /><b id="mirrorOffsetVal"></b>
+          <button class="small" id="mirrorFull">⛶ 全屏</button><button class="small" id="mirrorClose">关闭</button>
+        </div>
+      </div>
     </div>
 
     <aside>
@@ -242,9 +255,10 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         </div>
         <div id="livePanel" class="stack small" hidden>
           <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
+          <button id="mirrorBtn" style="width:100%">📺 同步画面（看视频时用：画面延后到和手机声音对齐）</button>
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
-          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="3000" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
           <label><input type="checkbox" id="liveStems" /> 🎚 实时拆声部（人声/鼓/贝斯/伴奏，配合“声音分工”按位置分给各设备）</label>
           <label><input type="checkbox" id="pcPlay" /> 电脑也出声（关掉 = 只有手机/平板出声，电脑静音）</label>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
@@ -4264,13 +4278,14 @@ class LiveCapture extends EventTarget {
     }
     // 共享的是标签页时，浏览器会把那个标签页在电脑上静音（避免听到比手机早的声音）
     this.surface = stream.getVideoTracks()[0]?.getSettings?.().displaySurface || 'unknown';
-    stream.getVideoTracks().forEach((t) => (t.enabled = false)); // 画面不需要
+
     return this.startFromStream(stream);
   }
 
   async startFromStream(stream) {
     await this.stop();
     this.stream = stream;
+    this.videoTrack = stream.getVideoTracks()[0] || null; // 画面留着给“同步画面”用
     this.ctx = new AudioContext({ sampleRate: SR });
     await this.ctx.resume();
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
@@ -4308,7 +4323,7 @@ class LiveCapture extends EventTarget {
     this.running = false;
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
     try { await this.ctx?.close(); } catch {}
-    this.stream = null; this.ctx = null;
+    this.stream = null; this.ctx = null; this.videoTrack = null;
     this.emit('state', false);
   }
 }
@@ -4393,6 +4408,61 @@ class LiveDecoder {
     dec.q.push(ts);
     if (dec.q.length > 50) dec.q.shift();
     dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1000), data: payload }));
+  }
+}
+
+
+// 同步画面：把共享的画面延后同样的缓冲时间再显示，和手机放出的声音对齐
+class VideoMirror {
+  constructor(canvas, getDelayMs) {
+    this.canvas = canvas; this.ctx2d = canvas.getContext('2d'); this.getDelay = getDelayMs;
+    this.q = []; this.running = false;
+  }
+  static supported() { return typeof window.MediaStreamTrackProcessor === 'function'; }
+  start(track) {
+    this.stop();
+    if (!track || !VideoMirror.supported()) return false;
+    this.running = true;
+    this.reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    this.pump();
+    const draw = () => { if (!this.running) return; this.draw(); requestAnimationFrame(draw); };
+    requestAnimationFrame(draw);
+    return true;
+  }
+  async pump() {
+    const reader = this.reader;
+    while (this.running && reader === this.reader) {
+      let r;
+      try { r = await reader.read(); } catch { break; }
+      if (r.done) break;
+      const frame = r.value, t = performance.now();
+      try {
+        // 缩小后转成图片保存，原始画面帧马上释放（采集端的帧数量有限，扣着不放会卡住）
+        const w = Math.min(1280, frame.displayWidth), h = Math.round((frame.displayHeight * w) / frame.displayWidth);
+        const bmp = await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' });
+        this.q.push({ t, bmp });
+      } catch {}
+      frame.close();
+      while (this.q.length > 150) this.q.shift().bmp.close(); // 最多存约 5 秒
+    }
+  }
+  draw() {
+    const due = performance.now() - this.getDelay();
+    let pick = null;
+    while (this.q.length && this.q[0].t <= due) { if (pick) pick.bmp.close(); pick = this.q.shift(); }
+    if (!pick) return;
+    const { bmp } = pick, c = this.canvas;
+    if (c.width !== bmp.width || c.height !== bmp.height) { c.width = bmp.width; c.height = bmp.height; }
+    this.ctx2d.drawImage(bmp, 0, 0);
+    this.last?.bmp.close();
+    this.last = pick;
+  }
+  stop() {
+    this.running = false;
+    try { this.reader?.cancel(); } catch {}
+    this.reader = null;
+    for (const x of this.q) x.bmp.close();
+    this.q = [];
   }
 }
 
@@ -4577,7 +4647,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, mirrorOffset: 0, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -4626,13 +4696,13 @@ const host = {
     this.live.addEventListener('state', (e) => this.onLiveState(e.detail));
     setInterval(() => this.tick(), 500);
     window.smHost = this; // 调试用
-    // 控制端被最小化/被游戏挡住时：先把缓冲加大到至少 600ms，回到前台再恢复
+    // 控制端被最小化/切到别的软件时：先把缓冲加大到至少 1500ms（画面用“同步画面”跟着延后），回到前台再恢复
     document.addEventListener('visibilitychange', () => {
       if (!H.autoDelay) return;
-      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 600) {
-        this.boostFrom = H.liveDelay; H.liveDelay = 600; this.lastBump = Date.now(); this.changed();
+      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 1500) {
+        this.boostFrom = H.liveDelay; H.liveDelay = 1500; this.lastBump = Date.now(); this.changed();
       } else if (document.visibilityState === 'visible' && this.boostFrom) {
-        if (H.liveDelay === 600) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
+        if (H.liveDelay === 1500) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
         this.boostFrom = null; this.changed();
       }
     });
@@ -4689,15 +4759,15 @@ const host = {
       const wasHidden = H.devices[c.did].stats?.hidden;
       H.devices[c.did].stats = msg.stats || {};
       // 有手机切到后台：它的网页会被系统降速，先把缓冲提到至少 800ms 给它留余量
-      if (H.autoDelay && this.live.running && msg.stats?.hidden && !wasHidden && H.liveDelay < 800) {
-        H.liveDelay = 800; this.lastBump = Date.now();
-        toast(`${H.devices[c.did].name} 切到后台了，缓冲自动加到 800 ms`);
+      if (H.autoDelay && this.live.running && msg.stats?.hidden && !wasHidden && H.liveDelay < 1500) {
+        H.liveDelay = 1500; this.lastBump = Date.now();
+        toast(`${H.devices[c.did].name} 切到后台了，缓冲自动加到 1500 ms（可以打开“同步画面”让画面也跟着延后）`);
         this.changed();
       }
       // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
       const late = msg.stats?.live?.late;
-      if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 1500) {
-        H.liveDelay = Math.min(1500, H.liveDelay + 150);
+      if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 3000) {
+        H.liveDelay = Math.min(3000, H.liveDelay + 250);
         this.lastBump = Date.now();
         toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -4760,8 +4830,8 @@ const host = {
     if (now - (this.lagWin || 0) > 2000) {
       this.lagShown = this.lagMax; this.lagMax = 0; this.lagWin = now;
       // 处理延迟已经吃掉大部分缓冲 → 自动加大（留 150ms 给网络和手机）
-      if (H.autoDelay && this.lagShown + 150 > H.liveDelay && H.liveDelay < 1500) {
-        H.liveDelay = Math.min(1500, Math.ceil((this.lagShown + 200) / 50) * 50);
+      if (H.autoDelay && this.lagShown + 150 > H.liveDelay && H.liveDelay < 3000) {
+        H.liveDelay = Math.min(3000, Math.ceil((this.lagShown + 200) / 50) * 50);
         this.lastBump = now;
         toast(`电脑处理跟不上（慢了 ${Math.round(this.lagShown)} ms），缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -4815,6 +4885,26 @@ const host = {
     this.libSig = null;
     this.changed();
   },
+  // 画面延迟 = 缓冲延迟 + 各设备平均位置延迟 + 手动微调
+  mirrorDelay() {
+    const plans = Object.values(this.plans());
+    const avgD = plans.length ? plans.reduce((a, p) => a + p.delayMs, 0) / plans.length : 0;
+    const avgLat = Object.values(H.devices).filter((d) => d.online).reduce((a, d, _, arr) => a + d.latencyMs / arr.length, 0);
+    return Math.max(0, H.liveDelay + avgD + avgLat + (H.mirrorOffset || 0));
+  },
+  toggleMirror(on) {
+    if (on === undefined) on = $('#mirrorBox').hidden;
+    if (on) {
+      if (!VideoMirror.supported()) return toast('这个浏览器不支持同步画面，请用电脑版 Chrome 或 Edge');
+      if (!this.live.running || !this.live.videoTrack) return toast('先开始共享电脑声音（共享时会一起拿到画面）');
+      this.mirror = this.mirror || new VideoMirror($('#mirror'), () => this.mirrorDelay());
+      this.mirror.start(this.live.videoTrack);
+      $('#mirrorBox').hidden = false;
+    } else {
+      this.mirror?.stop();
+      $('#mirrorBox').hidden = true;
+    }
+  },
   resetLivePipeline() {
     this.sep = null;
     for (const e of this.encoders.values()) e.close();
@@ -4822,6 +4912,8 @@ const host = {
   },
   onLiveState(on) {
     this.resetLivePipeline(); // 每次开始/停止共享都从干净的状态开始
+    if (!on && this.mirror) this.toggleMirror(false);
+    else if (on && !$('#mirrorBox').hidden) this.toggleMirror(true);
     if (on) { H.currentGroupId = 'live'; H.playback = { status: 'playing', startServerTime: hostNow(), startOffset: 0 }; }
     else if (H.currentGroupId === 'live') H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
     this.updateOpusWant();
@@ -4960,6 +5052,10 @@ const host = {
     $('#liveDelay').oninput = (e) => { H.liveDelay = Number(e.target.value); this.changed(); };
     $('#autoDelay').onchange = (e) => { H.autoDelay = e.target.checked; this.changed(); };
     $('#liveStems').onchange = (e) => this.setLiveStems(e.target.checked);
+    $('#mirrorBtn').onclick = () => this.toggleMirror();
+    $('#mirrorClose').onclick = () => this.toggleMirror(false);
+    $('#mirrorFull').onclick = () => $('#mirrorBox').requestFullscreen?.().catch(() => toast('无法全屏'));
+    $('#mirrorOffset').oninput = (e) => { H.mirrorOffset = Number(e.target.value); this.changed(); };
     $('#pcPlay').onchange = (e) => {
       H.pcPlay = e.target.checked;
       // 正在共享时立刻生效
@@ -5342,6 +5438,9 @@ const host = {
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
     $('#liveStems').checked = !!H.liveStems;
+    if (document.activeElement !== $('#mirrorOffset')) $('#mirrorOffset').value = H.mirrorOffset || 0;
+    $('#mirrorOffsetVal').textContent = `${(H.mirrorOffset || 0) > 0 ? '+' : ''}${H.mirrorOffset || 0} ms`;
+    $('#mirrorInfo').textContent = `画面延后 ${Math.round(this.mirrorDelay())} ms，和手机的声音对齐`;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && H.opus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);

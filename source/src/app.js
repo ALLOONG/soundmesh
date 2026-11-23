@@ -3,7 +3,7 @@ import { computeMix, assignLabel, assignOptions, guessRole } from './mix.js';
 import { Engine, motionAngle } from './engine.js';
 import { BUILTIN_GROUPS } from './synth.js';
 import { MultiHostLink, AutoNodeLink, packBin } from './transport.js';
-import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder } from './live.js';
+import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder, VideoMirror } from './live.js';
 import { Separator, STEMS, STEM_NAMES } from './separator.js';
 import { searchLyrics, parseLRC, lineAt } from './lyrics.js';
 import { MicRecorder, detectChirps, median, analyzeWindows } from './calib.js';
@@ -179,7 +179,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, mirrorOffset: 0, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -228,13 +228,13 @@ const host = {
     this.live.addEventListener('state', (e) => this.onLiveState(e.detail));
     setInterval(() => this.tick(), 500);
     window.smHost = this; // 调试用
-    // 控制端被最小化/被游戏挡住时：先把缓冲加大到至少 600ms，回到前台再恢复
+    // 控制端被最小化/切到别的软件时：先把缓冲加大到至少 1500ms（画面用“同步画面”跟着延后），回到前台再恢复
     document.addEventListener('visibilitychange', () => {
       if (!H.autoDelay) return;
-      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 600) {
-        this.boostFrom = H.liveDelay; H.liveDelay = 600; this.lastBump = Date.now(); this.changed();
+      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 1500) {
+        this.boostFrom = H.liveDelay; H.liveDelay = 1500; this.lastBump = Date.now(); this.changed();
       } else if (document.visibilityState === 'visible' && this.boostFrom) {
-        if (H.liveDelay === 600) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
+        if (H.liveDelay === 1500) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
         this.boostFrom = null; this.changed();
       }
     });
@@ -291,15 +291,15 @@ const host = {
       const wasHidden = H.devices[c.did].stats?.hidden;
       H.devices[c.did].stats = msg.stats || {};
       // 有手机切到后台：它的网页会被系统降速，先把缓冲提到至少 800ms 给它留余量
-      if (H.autoDelay && this.live.running && msg.stats?.hidden && !wasHidden && H.liveDelay < 800) {
-        H.liveDelay = 800; this.lastBump = Date.now();
-        toast(`${H.devices[c.did].name} 切到后台了，缓冲自动加到 800 ms`);
+      if (H.autoDelay && this.live.running && msg.stats?.hidden && !wasHidden && H.liveDelay < 1500) {
+        H.liveDelay = 1500; this.lastBump = Date.now();
+        toast(`${H.devices[c.did].name} 切到后台了，缓冲自动加到 1500 ms（可以打开“同步画面”让画面也跟着延后）`);
         this.changed();
       }
       // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
       const late = msg.stats?.live?.late;
-      if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 1500) {
-        H.liveDelay = Math.min(1500, H.liveDelay + 150);
+      if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 3000) {
+        H.liveDelay = Math.min(3000, H.liveDelay + 250);
         this.lastBump = Date.now();
         toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -362,8 +362,8 @@ const host = {
     if (now - (this.lagWin || 0) > 2000) {
       this.lagShown = this.lagMax; this.lagMax = 0; this.lagWin = now;
       // 处理延迟已经吃掉大部分缓冲 → 自动加大（留 150ms 给网络和手机）
-      if (H.autoDelay && this.lagShown + 150 > H.liveDelay && H.liveDelay < 1500) {
-        H.liveDelay = Math.min(1500, Math.ceil((this.lagShown + 200) / 50) * 50);
+      if (H.autoDelay && this.lagShown + 150 > H.liveDelay && H.liveDelay < 3000) {
+        H.liveDelay = Math.min(3000, Math.ceil((this.lagShown + 200) / 50) * 50);
         this.lastBump = now;
         toast(`电脑处理跟不上（慢了 ${Math.round(this.lagShown)} ms），缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -417,6 +417,26 @@ const host = {
     this.libSig = null;
     this.changed();
   },
+  // 画面延迟 = 缓冲延迟 + 各设备平均位置延迟 + 手动微调
+  mirrorDelay() {
+    const plans = Object.values(this.plans());
+    const avgD = plans.length ? plans.reduce((a, p) => a + p.delayMs, 0) / plans.length : 0;
+    const avgLat = Object.values(H.devices).filter((d) => d.online).reduce((a, d, _, arr) => a + d.latencyMs / arr.length, 0);
+    return Math.max(0, H.liveDelay + avgD + avgLat + (H.mirrorOffset || 0));
+  },
+  toggleMirror(on) {
+    if (on === undefined) on = $('#mirrorBox').hidden;
+    if (on) {
+      if (!VideoMirror.supported()) return toast('这个浏览器不支持同步画面，请用电脑版 Chrome 或 Edge');
+      if (!this.live.running || !this.live.videoTrack) return toast('先开始共享电脑声音（共享时会一起拿到画面）');
+      this.mirror = this.mirror || new VideoMirror($('#mirror'), () => this.mirrorDelay());
+      this.mirror.start(this.live.videoTrack);
+      $('#mirrorBox').hidden = false;
+    } else {
+      this.mirror?.stop();
+      $('#mirrorBox').hidden = true;
+    }
+  },
   resetLivePipeline() {
     this.sep = null;
     for (const e of this.encoders.values()) e.close();
@@ -424,6 +444,8 @@ const host = {
   },
   onLiveState(on) {
     this.resetLivePipeline(); // 每次开始/停止共享都从干净的状态开始
+    if (!on && this.mirror) this.toggleMirror(false);
+    else if (on && !$('#mirrorBox').hidden) this.toggleMirror(true);
     if (on) { H.currentGroupId = 'live'; H.playback = { status: 'playing', startServerTime: hostNow(), startOffset: 0 }; }
     else if (H.currentGroupId === 'live') H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
     this.updateOpusWant();
@@ -562,6 +584,10 @@ const host = {
     $('#liveDelay').oninput = (e) => { H.liveDelay = Number(e.target.value); this.changed(); };
     $('#autoDelay').onchange = (e) => { H.autoDelay = e.target.checked; this.changed(); };
     $('#liveStems').onchange = (e) => this.setLiveStems(e.target.checked);
+    $('#mirrorBtn').onclick = () => this.toggleMirror();
+    $('#mirrorClose').onclick = () => this.toggleMirror(false);
+    $('#mirrorFull').onclick = () => $('#mirrorBox').requestFullscreen?.().catch(() => toast('无法全屏'));
+    $('#mirrorOffset').oninput = (e) => { H.mirrorOffset = Number(e.target.value); this.changed(); };
     $('#pcPlay').onchange = (e) => {
       H.pcPlay = e.target.checked;
       // 正在共享时立刻生效
@@ -944,6 +970,9 @@ const host = {
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
     $('#liveStems').checked = !!H.liveStems;
+    if (document.activeElement !== $('#mirrorOffset')) $('#mirrorOffset').value = H.mirrorOffset || 0;
+    $('#mirrorOffsetVal').textContent = `${(H.mirrorOffset || 0) > 0 ? '+' : ''}${H.mirrorOffset || 0} ms`;
+    $('#mirrorInfo').textContent = `画面延后 ${Math.round(this.mirrorDelay())} ms，和手机的声音对齐`;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && H.opus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);

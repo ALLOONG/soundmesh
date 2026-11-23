@@ -144,3 +144,8 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
 
 #canvas line, #canvas circle, #canvas rect { vector-effect: non-scaling-stroke; }
 #canvas .grid line.major { stroke: #2d3442; }
+
+.mirror-box { position: absolute; inset: 14px; background: #000; border-radius: 12px; display: flex; flex-direction: column; z-index: 4; overflow: hidden; }
+.mirror-box canvas { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
+.mirror-bar { padding: 8px 10px; background: #111a; }
+.mirror-box:fullscreen { inset: 0; border-radius: 0; }
