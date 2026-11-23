@@ -154,6 +154,9 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
 .ly-strip .ly-next { font-size: 15px; color: var(--muted); margin-top: 4px; }
 .node .ly-strip { width: min(520px, 94vw); margin: 0 auto 10px; background: #0005; border-radius: 12px; }
 .node .ly-strip .ly-cur { font-size: 26px; }
+
+#canvas line, #canvas circle, #canvas rect { vector-effect: non-scaling-stroke; }
+#canvas .grid line.major { stroke: #2d3442; }
 </style>
 </head>
 <body>
@@ -204,7 +207,8 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
       <div class="row small muted" style="margin-bottom:6px">
         <span>拖动设备摆放位置，👑 是听众位（甜点）。画布上方是“前方”。</span>
         <span class="grow"></span>
-        <button class="small" id="arc">设备排成弧形</button>
+<button class="small" id="deskMode">🪑 切换到桌面模式</button>
+                <button class="small" id="arc">设备排成弧形</button>
       </div>
       <svg id="canvas"></svg>
       <div id="stageLyric" class="ly-strip" hidden></div>
@@ -327,7 +331,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
             <div class="muted">画布上紫色的 🔊 是“虚拟声源”，离它越近的设备越响。设备分散摆在听众周围效果最明显（前后左右都有更好）。</div>
           </div>
         </div>
-        <div class="row small"><span>房间尺寸</span><input type="number" id="roomW" min="1" max="50" step="0.5" /> × <input type="number" id="roomH" min="1" max="50" step="0.5" /> 米</div>
+        <div class="row small"><span>房间尺寸</span><input type="number" id="roomW" min="0.5" max="50" step="0.1" /> × <input type="number" id="roomH" min="0.5" max="50" step="0.1" /> 米</div>
       </section>
 
       <section class="stack">
@@ -4950,7 +4954,7 @@ const host = {
     const bands = () => { H.bands = { lowCut: clampN($('#lowCut').value, 40, 1000, 150), highCut: clampN($('#highCut').value, 500, 12000, 2500) }; this.changed(); };
     $('#lowCut').onchange = bands; $('#highCut').onchange = bands;
     const size = () => {
-      H.size = { w: clampN($('#roomW').value, 1, 50, 8), h: clampN($('#roomH').value, 1, 50, 5) };
+      H.size = { w: clampN($('#roomW').value, 0.5, 50, 8), h: clampN($('#roomH').value, 0.5, 50, 5) };
       for (const o of [H.listener, ...Object.values(H.devices)]) { o.x = Math.min(o.x, H.size.w); o.y = Math.min(o.y, H.size.h); }
       this.changed();
     };
@@ -4959,6 +4963,14 @@ const host = {
       const n = Object.values(H.devices).filter((d) => !d.online).length;
       for (const [id, d] of Object.entries(H.devices)) if (!d.online) delete H.devices[id];
       toast(n ? `已清除 ${n} 台离线设备` : '没有离线设备');
+      this.changed();
+    };
+    $('#deskMode').onclick = () => {
+      const desk = Math.max(H.size.w, H.size.h) > 3;
+      if (desk) { H.size = { w: 1.6, h: 1.3 }; H.listener = { x: 0.8, y: 1.08 }; }
+      else { H.size = { w: 8, h: 5 }; H.listener = { x: 4, y: 3.5 }; }
+      Object.values(H.devices).forEach((d, i) => Object.assign(d, arcSpot(i)));
+      toast(desk ? '已切换到桌面模式：把设备按桌上的实际位置拖好，👑 放在你坐的位置' : '已切换回房间模式');
       this.changed();
     };
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
@@ -5271,7 +5283,7 @@ const host = {
   animMotion() {
     const dot = document.getElementById('motionDot');
     if (!dot || H.motion.y === 'off') return;
-    const th = (motionAngle(H.motion, hostNow()) * Math.PI) / 180, R = Math.min(2.2, H.listener.y * 0.85);
+    const th = (motionAngle(H.motion, hostNow()) * Math.PI) / 180, R = Math.min(2.2, H.listener.y * 0.8, H.size.w / 2 - 0.05);
     const x = (H.listener.x + Math.sin(th) * R) * 100, y = (H.listener.y - Math.cos(th) * R) * 100;
     dot.setAttribute('transform', `translate(${x},${y})`);
   },
@@ -5315,50 +5327,57 @@ const host = {
       if (text !== undefined) n.textContent = text;
       return n;
     };
-    const { w, h } = H.size, pad = 40;
+    const { w, h } = H.size;
+    // 画布越小，图标和文字按比例缩小（桌面模式下 1 米多的画布也能摆得开）
+    const k = Math.max(0.16, Math.min(1, Math.max(w / 8, h / 5)));
+    const fs = (px) => `font-size:${(px * k).toFixed(2)}px`;
+    const pad = 40 * k;
     svg.setAttribute('viewBox', `${-pad} ${-pad} ${w * U + pad * 2} ${h * U + pad * 2}`);
     svg.replaceChildren();
-    svg.append(el('rect', { class: 'room', x: 0, y: 0, width: w * U, height: h * U, rx: 8 }));
+    svg.append(el('rect', { class: 'room', x: 0, y: 0, width: w * U, height: h * U, rx: 8 * k }));
+    const fine = Math.max(w, h) <= 3, step = fine ? 0.1 : 1;
     const grid = el('g', { class: 'grid' });
-    for (let x = 1; x < w; x++) grid.append(el('line', { x1: x * U, y1: 0, x2: x * U, y2: h * U }));
-    for (let y = 1; y < h; y++) grid.append(el('line', { x1: 0, y1: y * U, x2: w * U, y2: y * U }));
+    const cls = (i) => (fine && i % 5 === 0 ? 'major' : ''); // 桌面模式：每 50cm 一条粗线
+    for (let i = 1; i * step < w - 1e-6; i++) grid.append(el('line', { x1: i * step * U, y1: 0, x2: i * step * U, y2: h * U, class: cls(i) }));
+    for (let i = 1; i * step < h - 1e-6; i++) grid.append(el('line', { x1: 0, y1: i * step * U, x2: w * U, y2: i * step * U, class: cls(i) }));
     svg.append(grid);
-    svg.append(el('text', { x: (w * U) / 2, y: -14, 'text-anchor': 'middle', class: 'sub' }, `▲ 前方 / 舞台   （网格 1 米，房间 ${w}×${h} 米）`));
+    svg.append(el('text', { x: (w * U) / 2, y: -14 * k, 'text-anchor': 'middle', class: 'sub', style: fs(12) },
+      `▲ 前方   （网格 ${fine ? '10 厘米' : '1 米'}，${fine ? '桌面' : '房间'} ${w}×${h} 米）`));
     const L = H.listener, devs = Object.values(H.devices);
-    for (const d of devs) if (d.online) svg.append(el('line', { class: 'link', x1: L.x * U, y1: L.y * U, x2: d.x * U, y2: d.y * U }));
+    for (const d of devs) if (d.online) svg.append(el('line', { class: 'link', x1: L.x * U, y1: L.y * U, x2: d.x * U, y2: d.y * U, 'stroke-dasharray': `${6 * k} ${6 * k}` }));
     const lg = el('g', { class: 'listener', 'data-drag': 'listener', transform: `translate(${L.x * U},${L.y * U})` });
-    lg.append(el('circle', { r: 30, fill: '#ffd43b22', stroke: '#ffd43b', 'stroke-width': 2 }));
-    lg.append(el('text', { 'text-anchor': 'middle', y: 9, style: 'font-size:26px' }, '👑'));
-    lg.append(el('text', { 'text-anchor': 'middle', y: 50, class: 'sub' }, '听众位'));
+    lg.append(el('circle', { r: 30 * k, fill: '#ffd43b22', stroke: '#ffd43b', 'stroke-width': 2 }));
+    lg.append(el('text', { 'text-anchor': 'middle', y: 9 * k, style: fs(26) }, '👑'));
+    lg.append(el('text', { 'text-anchor': 'middle', y: 50 * k, class: 'sub', style: fs(12) }, '听众位'));
     svg.append(lg);
     if (H.motion.y !== 'off') {
       const md = el('g', { id: 'motionDot' });
-      md.append(el('circle', { r: 22, fill: '#cc5de855', stroke: '#cc5de8', 'stroke-width': 2 }));
-      md.append(el('text', { 'text-anchor': 'middle', y: 8, style: 'font-size:22px' }, '🔊'));
+      md.append(el('circle', { r: 22 * k, fill: '#cc5de855', stroke: '#cc5de8', 'stroke-width': 2 }));
+      md.append(el('text', { 'text-anchor': 'middle', y: 8 * k, style: fs(22) }, '🔊'));
       svg.append(md);
     }
     for (const d of devs) {
-      const plan = plans[d.id], r = 28;
+      const plan = plans[d.id], r = 28 * k;
       const g = el('g', { class: `dev ${d.online ? '' : 'offline'} ${this.selected === d.id ? 'selected' : ''}`, 'data-drag': 'dev', 'data-id': d.id, transform: `translate(${d.x * U},${d.y * U})` });
-      g.append(el('circle', { class: 'ring', r: r + 6 }));
-      if (plan) g.append(el('circle', { r: r + 2 + plan.gain * 14, fill: d.color + '22', stroke: 'none' }));
+      g.append(el('circle', { class: 'ring', r: r + 6 * k }));
+      if (plan) g.append(el('circle', { r: r + (2 + plan.gain * 14) * k, fill: d.color + '22', stroke: 'none' }));
       g.append(el('circle', { class: 'body', r, fill: d.color, stroke: '#0008', 'stroke-width': 2 }));
-      g.append(el('text', { 'text-anchor': 'middle', y: 9, style: 'font-size:24px' }, d.muted ? '🔇' : TYPE_ICON[d.type]));
-      g.append(el('text', { 'text-anchor': 'middle', y: r + 22 }, d.name));
+      g.append(el('text', { 'text-anchor': 'middle', y: 9 * k, style: fs(24) }, d.muted ? '🔇' : TYPE_ICON[d.type]));
+      g.append(el('text', { 'text-anchor': 'middle', y: r + 22 * k, style: fs(15) }, d.name));
       let sub = d.online ? '' : '离线';
       if (plan) {
         const parts = [`${Math.round(plan.gain * 100)}%`];
         const D = plan.delayMs + d.latencyMs;
         if (Math.abs(D) >= 0.05) parts.push(`${D > 0 ? '+' : ''}${D.toFixed(1)}ms`);
         if (H.mode === 'split') {
-          const a = plan.assign.map((k) => assignLabel(H, k).replace(/^声道 /, '')).join('+') || '无';
+          const a = plan.assign.map((x) => assignLabel(H, x).replace(/^声道 /, '')).join('+') || '无';
           parts.push(a.length > 18 ? a.slice(0, 17) + '…' : a);
         } else if (H.options.stereo) parts.push(plan.pan < -0.2 ? '偏左' : plan.pan > 0.2 ? '偏右' : '居中');
         if (d.override?.locked) parts.push('🔒');
         sub = parts.join(' · ');
         if (this.checkRes?.[d.id]) sub += `  🎙${this.checkRes[d.id].label}`;
       }
-      g.append(el('text', { 'text-anchor': 'middle', y: r + 40, class: 'sub' }, sub));
+      g.append(el('text', { 'text-anchor': 'middle', y: r + 40 * k, class: 'sub', style: fs(12) }, sub));
       svg.append(g);
     }
   },
@@ -5402,6 +5421,7 @@ const host = {
     setVal('#roomW', H.size.w); setVal('#roomH', H.size.h); setVal('#master', H.masterVolume);
     $('#masterVal').textContent = Math.round(H.masterVolume * 100) + '%';
     $('#splitBox').style.display = H.mode === 'split' ? '' : 'none';
+    $('#deskMode').textContent = Math.max(H.size.w, H.size.h) > 3 ? '🪑 切换到桌面模式' : '🏠 切回房间模式';
   },
 
   cards: new Map(),
@@ -5561,7 +5581,7 @@ const host = {
 function arcSpot(n) {
   const k = n % 9;
   const a = k === 0 ? 0 : (k % 2 ? -1 : 1) * Math.ceil(k / 2) * 0.5;
-  const R = Math.min(2.5, H.listener.y * 0.9);
+  const R = Math.min(2.5, H.listener.y * 0.85, H.size.w / 2 - 0.05);
   return {
     x: Math.min(H.size.w, Math.max(0, H.listener.x + Math.sin(a) * R)),
     y: Math.min(H.size.h, Math.max(0, H.listener.y - Math.cos(a) * R)),

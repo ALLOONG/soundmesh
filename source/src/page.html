@@ -61,7 +61,8 @@
       <div class="row small muted" style="margin-bottom:6px">
         <span>拖动设备摆放位置，👑 是听众位（甜点）。画布上方是“前方”。</span>
         <span class="grow"></span>
-        <button class="small" id="arc">设备排成弧形</button>
+<button class="small" id="deskMode">🪑 切换到桌面模式</button>
+                <button class="small" id="arc">设备排成弧形</button>
       </div>
       <svg id="canvas"></svg>
       <div id="stageLyric" class="ly-strip" hidden></div>
@@ -184,7 +185,7 @@
             <div class="muted">画布上紫色的 🔊 是“虚拟声源”，离它越近的设备越响。设备分散摆在听众周围效果最明显（前后左右都有更好）。</div>
           </div>
         </div>
-        <div class="row small"><span>房间尺寸</span><input type="number" id="roomW" min="1" max="50" step="0.5" /> × <input type="number" id="roomH" min="1" max="50" step="0.5" /> 米</div>
+        <div class="row small"><span>房间尺寸</span><input type="number" id="roomW" min="0.5" max="50" step="0.1" /> × <input type="number" id="roomH" min="0.5" max="50" step="0.1" /> 米</div>
       </section>
 
       <section class="stack">

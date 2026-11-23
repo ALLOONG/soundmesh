@@ -141,3 +141,6 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
 .ly-strip .ly-next { font-size: 15px; color: var(--muted); margin-top: 4px; }
 .node .ly-strip { width: min(520px, 94vw); margin: 0 auto 10px; background: #0005; border-radius: 12px; }
 .node .ly-strip .ly-cur { font-size: 26px; }
+
+#canvas line, #canvas circle, #canvas rect { vector-effect: non-scaling-stroke; }
+#canvas .grid line.major { stroke: #2d3442; }
