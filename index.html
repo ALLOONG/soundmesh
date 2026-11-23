@@ -4364,6 +4364,41 @@ class LiveDecoder {
 
 
 
+// ---------------- 后台不降速的计时器 ----------------
+// 标签页切到后台后，浏览器会把 setTimeout/setInterval 降到每秒一次，静音页面 5 分钟后甚至每分钟一次。
+// 后台线程（Worker）里的计时器不受这个限制，所以把整个页面（包括连接库）的计时器都换成由 Worker 驱动。
+(function installWorkerTimers() {
+  const src = `const t=new Map();onmessage=(e)=>{const d=e.data;if(d.c==='set'){const f=()=>{postMessage(d.id);if(d.r&&t.has(d.id))t.set(d.id,setTimeout(f,d.ms));else t.delete(d.id);};t.set(d.id,setTimeout(f,d.ms));}else{clearTimeout(t.get(d.id));t.delete(d.id);}};`;
+  let w;
+  try { w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))); } catch { return; }
+  const oSet = window.setTimeout.bind(window), oInt = window.setInterval.bind(window);
+  const oClrT = window.clearTimeout.bind(window), oClrI = window.clearInterval.bind(window);
+  const cbs = new Map();
+  let next = 1e7;
+  w.onmessage = (e) => {
+    const c = cbs.get(e.data);
+    if (!c) return;
+    if (!c.r) cbs.delete(e.data);
+    try { c.fn(...c.args); } catch (err) { queueMicrotask(() => { throw err; }); }
+  };
+  w.onerror = () => { // Worker 出问题就退回原生计时器
+    window.setTimeout = oSet; window.setInterval = oInt; window.clearTimeout = oClrT; window.clearInterval = oClrI;
+  };
+  const make = (r, orig) => (fn, ms = 0, ...args) => {
+    if (typeof fn !== 'function') return orig(fn, ms, ...args);
+    const id = next++;
+    cbs.set(id, { fn, args, r });
+    w.postMessage({ c: 'set', id, ms: Math.max(r ? 4 : 0, Number(ms) || 0), r });
+    return id;
+  };
+  const clear = (orig) => (id) => {
+    if (cbs.delete(id)) w.postMessage({ c: 'clear', id });
+    else orig(id);
+  };
+  window.setTimeout = make(false, oSet); window.setInterval = make(true, oInt);
+  window.clearTimeout = clear(oClrT); window.clearInterval = clear(oClrI);
+})();
+
 // ---------------- 小工具 ----------------
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
