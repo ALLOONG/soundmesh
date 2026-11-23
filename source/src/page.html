@@ -91,13 +91,15 @@
           <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
-          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="300" max="2500" step="50" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="120" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
           <label><input type="checkbox" id="opusOn" /> 压缩传输（Opus，省流量；不支持的设备自动用无损）</label>
           <div class="muted">
             点按钮后会弹出“共享”窗口：<br />
             · 在<b>标签页</b>里选正在放 YouTube Music 的网页，并打开“<b>同时共享标签页音频</b>”；<br />
             · 或选<b>整个屏幕</b>并打开“<b>同时共享系统音频</b>”（Spotify 等桌面软件用这个）。<br />
-            各设备会比电脑晚“缓冲延迟”这么多出声：听音乐没影响；看视频请把电脑本身静音。卡顿就把缓冲调大。
+            共享<b>标签页</b>时，那个标签页在电脑上会被自动静音，电脑改为和手机一起同步出声（自动打开“本机也出声”）。<br />
+            缓冲延迟越小越跟手，但网络差时会断断续续；同一个 Wi-Fi / 热点下一般 150~300 ms 就够。
           </div>
         </div>
         <div class="row small"><span>总音量</span><input type="range" id="master" min="0" max="1.5" step="0.01" class="grow" style="width:auto" /><span id="masterVal"></span></div>

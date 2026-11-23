@@ -43,13 +43,15 @@ export class LiveCapture extends EventTarget {
     if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('这个浏览器不支持共享声音，请在电脑上用 Chrome 或 Edge');
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: true,
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false, restrictOwnAudio: true },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: true, restrictOwnAudio: true },
       systemAudio: 'include', selfBrowserSurface: 'exclude', surfaceSwitching: 'include',
     });
     if (!stream.getAudioTracks().length) {
       stream.getTracks().forEach((t) => t.stop());
       throw new Error('没有抓到声音：共享时要勾选“共享标签页音频”或“共享系统音频”');
     }
+    // 共享的是标签页时，浏览器会把那个标签页在电脑上静音（避免听到比手机早的声音）
+    this.surface = stream.getVideoTracks()[0]?.getSettings?.().displaySurface || 'unknown';
     stream.getVideoTracks().forEach((t) => (t.enabled = false)); // 画面不需要
     return this.startFromStream(stream);
   }

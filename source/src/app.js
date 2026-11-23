@@ -104,7 +104,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 800, opus: true,
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true,
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -115,6 +115,7 @@ function startHost(code, resume) {
   H.library = [structuredClone(LIVE_GROUP), ...structuredClone(BUILTIN_GROUPS), ...(H.library || []).filter((g) => g.kind === 'file')];
   if (!H.library.some((g) => g.id === H.currentGroupId) || H.currentGroupId === 'live') H.currentGroupId = 'demo-mix';
   H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
+  if (!saved?.v2) { H.liveDelay = 350; H.autoDelay = true; H.v2 = true; } // 旧版本默认 800ms 太保守
   for (const d of Object.values(H.devices)) d.online = false;
   delete H.devices.self;
   $('#landing').hidden = true;
@@ -196,7 +197,15 @@ const host = {
     } else if (msg.t === 'ping') {
       this.link.send(c, { t: 'pong', c: msg.c, s: hostNow(), ep: EPOCH });
     } else if (msg.t === 'stats' && H.devices[c.did]) {
+      const prevLate = H.devices[c.did].stats?.live?.late;
       H.devices[c.did].stats = msg.stats || {};
+      // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
+      const late = msg.stats?.live?.late;
+      if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 1500) {
+        H.liveDelay = Math.min(1500, H.liveDelay + 50);
+        toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
+        this.changed();
+      }
       this.renderSoon();
     } else if (msg.t === 'self' && H.devices[c.did]) {
       const d = H.devices[c.did];
@@ -272,10 +281,18 @@ const host = {
   },
   async toggleLive() {
     if (this.live.running) return this.live.stop();
+    // 必须在这次点击里先启用本机声音（浏览器要求声音由点击触发）；
+    // 共享的是标签页时电脑原声会被静音，电脑就改为和手机一起同步出声
+    const autoSelf = !this.selfEngine;
+    if (autoSelf) this.toggleSelf();
     try {
-      if (this.selfEngine) toast('提示：如果共享的是“整个屏幕 + 系统音频”，请关掉“本机也出声”，否则会形成回声');
       await this.live.startCapture();
+      if (autoSelf && this.live.surface !== 'browser') {
+        this.toggleSelf(); // 共享整个屏幕时电脑本来就有原声，再出声会有回声
+        toast('共享的是整个屏幕：电脑保持原声，手机会比电脑晚一点（等于缓冲延迟）');
+      }
     } catch (e) {
+      if (autoSelf && this.selfEngine) this.toggleSelf();
       if (e.name !== 'NotAllowedError') toast(e.message || String(e));
     }
   },
@@ -373,6 +390,7 @@ const host = {
     $('#master').oninput = (e) => { H.masterVolume = Number(e.target.value); this.changed(); };
     $('#liveBtn').onclick = () => this.toggleLive();
     $('#liveDelay').oninput = (e) => { H.liveDelay = Number(e.target.value); this.changed(); };
+    $('#autoDelay').onchange = (e) => { H.autoDelay = e.target.checked; this.changed(); };
     $('#opusOn').onchange = (e) => { H.opus = e.target.checked; this.updateOpusWant(); this.changed(); };
     $$('#modeSeg button').forEach((b) => (b.onclick = () => { H.mode = b.dataset.mode; this.changed(); }));
     $$('[data-opt]').forEach((c) => (c.onchange = () => { H.options[c.dataset.opt] = c.checked; this.changed(); }));
@@ -505,6 +523,7 @@ const host = {
     if (document.activeElement !== $('#liveDelay')) $('#liveDelay').value = H.liveDelay;
     $('#liveDelayVal').textContent = `${H.liveDelay} ms`;
     $('#opusOn').checked = H.opus;
+    $('#autoDelay').checked = H.autoDelay;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && this.live.wantOpus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);

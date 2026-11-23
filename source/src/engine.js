@@ -249,7 +249,7 @@ export class Engine extends EventTarget {
     const cur = this.cur;
     if (!this.unlocked || !this.clock.synced || !cur?.plan || cur.group?.kind !== 'live' || !this.liveIn) return;
     this.liveStats.got++;
-    const expected = this.clockToCtx(ts + (cur.ld || 800) + cur.plan.D);
+    const expected = this.clockToCtx(ts + (cur.ld || 350) + cur.plan.D);
     const now = this.ctx.currentTime;
     if (expected + buffer.duration < now + 0.005) { this.liveStats.late++; return; } // 来得太晚，丢掉
     let when, rate = 1;
