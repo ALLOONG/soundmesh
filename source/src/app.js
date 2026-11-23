@@ -385,6 +385,21 @@ const host = {
     for (let i = 0; i < l.length; i += 4) { const v = Math.abs(l[i]) + Math.abs(r[i]); if (v > pk) pk = v; }
     if (pk < 0.001) this.dg.silent++;
     this.dg.peak = Math.max(this.dg.peak || 0, pk);
+    // 暂停检测：连续 60ms 完全没声（说明音源暂停了）→ 立刻通知所有设备静音；有声音了再恢复
+    if (pk < 0.0005) {
+      if (++this.silentRun === 3 && !this.hushed && H.currentGroupId === 'live') {
+        this.hushed = true;
+        this.link?.broadcast({ t: 'hush', on: true });
+        this.selfEngine?.hush(true);
+      }
+    } else {
+      this.silentRun = 0;
+      if (this.hushed) {
+        this.hushed = false;
+        this.link?.broadcast({ t: 'hush', on: false, at: ts });
+        this.selfEngine?.hush(false, ts);
+      }
+    }
     if (H.currentGroupId !== 'live') return;
     // 电脑自己处理慢了多少：这段声音采集完到现在过了多久（玩游戏/最小化时 CPU 被抢走会变大）
     const lag = hostNow() - (ts + 20);
@@ -479,6 +494,8 @@ const host = {
     this.encoders.clear();
   },
   onLiveState(on) {
+    if (this.hushed) { this.hushed = false; this.link?.broadcast({ t: 'hush', on: false }); this.selfEngine?.hush(false); }
+    this.silentRun = 0;
     this.resetLivePipeline(); // 每次开始/停止共享都从干净的状态开始
     if (!on && this.mirror) this.toggleMirror(false);
     else if (on && !$('#mirrorBox').hidden) this.toggleMirror(true);
@@ -601,6 +618,7 @@ const host = {
   },
   selectGroup(id) {
     if (id === H.currentGroupId) return;
+    if (this.hushed) { this.hushed = false; this.link?.broadcast({ t: 'hush', on: false }); this.selfEngine?.hush(false); }
     if (this.live.running && id !== 'live') this.live.stop();
     H.currentGroupId = id;
     H.ly = { a: null, s: 0, o: 0 };
@@ -1384,6 +1402,8 @@ const node = {
     } else if (m.t === 'beep') {
       this.engine.beep();
       const el = $('#nodeMain'); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    } else if (m.t === 'hush') {
+      this.engine.hush(!!m.on, m.at);
     } else if (m.t === 'lyrics') {
       this.lyrics = m.ly;
     } else if (m.t === 'chirp' && Array.isArray(m.at)) {

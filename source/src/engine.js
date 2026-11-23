@@ -26,8 +26,10 @@ export class Engine extends EventTarget {
     this.master.connect(this.ctx.destination);
     this.deviceGain = this.ctx.createGain();
     this.motionGain = this.ctx.createGain(); // 环绕移动音效：在设备增益之后再乘一层随时间变化的增益
+    this.hushGain = this.ctx.createGain(); // 暂停检测：音源一暂停就立刻静音
     this.deviceGain.connect(this.motionGain);
-    this.motionGain.connect(this.master);
+    this.motionGain.connect(this.hushGain);
+    this.hushGain.connect(this.master);
     this.motionTimer = setInterval(() => this.tickMotion(), 40);
     this.unlocked = false;
     this.buffers = new Map(); // src -> { promise, buffer, error }
@@ -117,6 +119,16 @@ export class Engine extends EventTarget {
     const lobe = Math.pow((1 + Math.cos((d * Math.PI) / 180)) / 2, 3);
     const val = 1 - mo.d + mo.d * lobe;
     g.setTargetAtTime(val, Math.max(t, this.clockToCtx(at)), 0.05);
+  }
+
+  // 音源暂停了：马上淡出（不再把缓冲里剩下的声音放完）。恢复：在恢复那一段该出声的时刻淡入
+  hush(on, at) {
+    const g = this.hushGain.gain, t = this.ctx.currentTime;
+    g.cancelScheduledValues(t);
+    if (on) { g.setTargetAtTime(0, t, 0.015); return; }
+    const when = at ? Math.max(t, this.clockToCtx(at + (this.cur?.ld || 350) + (this.cur?.plan?.D || 0)) - 0.02) : t;
+    g.setValueAtTime(g.value, t);
+    g.setTargetAtTime(1, when, 0.01);
   }
 
   // 分工检查：只在 [from, to) 这段时间出声，其余时间（到 end 为止）静音

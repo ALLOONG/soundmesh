@@ -220,7 +220,8 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
       <div id="mirrorBox" class="mirror-box" hidden>
         <canvas id="mirror"></canvas>
         <div class="row small mirror-bar">
-          <span id="mirrorInfo" class="muted"></span><span class="grow"></span>
+          <span id="mirrorInfo" class="muted"></span>
+          <span class="muted">· 暂停/切歌：用键盘的 ⏯ ⏭ 媒体键，或 Chrome 右上角的 ♫ 媒体控件</span><span class="grow"></span>
           <span>画面微调</span><input type="range" id="mirrorOffset" min="-500" max="500" step="10" style="width:140px" /><b id="mirrorOffsetVal"></b>
           <button class="small" id="mirrorFull">⛶ 全屏</button><button class="small" id="mirrorClose">关闭</button>
         </div>
@@ -3557,8 +3558,10 @@ class Engine extends EventTarget {
     this.master.connect(this.ctx.destination);
     this.deviceGain = this.ctx.createGain();
     this.motionGain = this.ctx.createGain(); // 环绕移动音效：在设备增益之后再乘一层随时间变化的增益
+    this.hushGain = this.ctx.createGain(); // 暂停检测：音源一暂停就立刻静音
     this.deviceGain.connect(this.motionGain);
-    this.motionGain.connect(this.master);
+    this.motionGain.connect(this.hushGain);
+    this.hushGain.connect(this.master);
     this.motionTimer = setInterval(() => this.tickMotion(), 40);
     this.unlocked = false;
     this.buffers = new Map(); // src -> { promise, buffer, error }
@@ -3648,6 +3651,16 @@ class Engine extends EventTarget {
     const lobe = Math.pow((1 + Math.cos((d * Math.PI) / 180)) / 2, 3);
     const val = 1 - mo.d + mo.d * lobe;
     g.setTargetAtTime(val, Math.max(t, this.clockToCtx(at)), 0.05);
+  }
+
+  // 音源暂停了：马上淡出（不再把缓冲里剩下的声音放完）。恢复：在恢复那一段该出声的时刻淡入
+  hush(on, at) {
+    const g = this.hushGain.gain, t = this.ctx.currentTime;
+    g.cancelScheduledValues(t);
+    if (on) { g.setTargetAtTime(0, t, 0.015); return; }
+    const when = at ? Math.max(t, this.clockToCtx(at + (this.cur?.ld || 350) + (this.cur?.plan?.D || 0)) - 0.02) : t;
+    g.setValueAtTime(g.value, t);
+    g.setTargetAtTime(1, when, 0.01);
   }
 
   // 分工检查：只在 [from, to) 这段时间出声，其余时间（到 end 为止）静音
@@ -4949,6 +4962,21 @@ const host = {
     for (let i = 0; i < l.length; i += 4) { const v = Math.abs(l[i]) + Math.abs(r[i]); if (v > pk) pk = v; }
     if (pk < 0.001) this.dg.silent++;
     this.dg.peak = Math.max(this.dg.peak || 0, pk);
+    // 暂停检测：连续 60ms 完全没声（说明音源暂停了）→ 立刻通知所有设备静音；有声音了再恢复
+    if (pk < 0.0005) {
+      if (++this.silentRun === 3 && !this.hushed && H.currentGroupId === 'live') {
+        this.hushed = true;
+        this.link?.broadcast({ t: 'hush', on: true });
+        this.selfEngine?.hush(true);
+      }
+    } else {
+      this.silentRun = 0;
+      if (this.hushed) {
+        this.hushed = false;
+        this.link?.broadcast({ t: 'hush', on: false, at: ts });
+        this.selfEngine?.hush(false, ts);
+      }
+    }
     if (H.currentGroupId !== 'live') return;
     // 电脑自己处理慢了多少：这段声音采集完到现在过了多久（玩游戏/最小化时 CPU 被抢走会变大）
     const lag = hostNow() - (ts + 20);
@@ -5043,6 +5071,8 @@ const host = {
     this.encoders.clear();
   },
   onLiveState(on) {
+    if (this.hushed) { this.hushed = false; this.link?.broadcast({ t: 'hush', on: false }); this.selfEngine?.hush(false); }
+    this.silentRun = 0;
     this.resetLivePipeline(); // 每次开始/停止共享都从干净的状态开始
     if (!on && this.mirror) this.toggleMirror(false);
     else if (on && !$('#mirrorBox').hidden) this.toggleMirror(true);
@@ -5165,6 +5195,7 @@ const host = {
   },
   selectGroup(id) {
     if (id === H.currentGroupId) return;
+    if (this.hushed) { this.hushed = false; this.link?.broadcast({ t: 'hush', on: false }); this.selfEngine?.hush(false); }
     if (this.live.running && id !== 'live') this.live.stop();
     H.currentGroupId = id;
     H.ly = { a: null, s: 0, o: 0 };
@@ -5948,6 +5979,8 @@ const node = {
     } else if (m.t === 'beep') {
       this.engine.beep();
       const el = $('#nodeMain'); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    } else if (m.t === 'hush') {
+      this.engine.hush(!!m.on, m.at);
     } else if (m.t === 'lyrics') {
       this.lyrics = m.ly;
     } else if (m.t === 'chirp' && Array.isArray(m.at)) {
