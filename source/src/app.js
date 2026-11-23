@@ -288,11 +288,18 @@ const host = {
       this.link.send(c, { t: 'pong', c: msg.c, s: hostNow(), ep: EPOCH });
     } else if (msg.t === 'stats' && H.devices[c.did]) {
       const prevLate = H.devices[c.did].stats?.live?.late;
+      const wasHidden = H.devices[c.did].stats?.hidden;
       H.devices[c.did].stats = msg.stats || {};
+      // 有手机切到后台：它的网页会被系统降速，先把缓冲提到至少 800ms 给它留余量
+      if (H.autoDelay && this.live.running && msg.stats?.hidden && !wasHidden && H.liveDelay < 800) {
+        H.liveDelay = 800; this.lastBump = Date.now();
+        toast(`${H.devices[c.did].name} 切到后台了，缓冲自动加到 800 ms`);
+        this.changed();
+      }
       // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
       const late = msg.stats?.live?.late;
       if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 1500) {
-        H.liveDelay = Math.min(1500, H.liveDelay + 50);
+        H.liveDelay = Math.min(1500, H.liveDelay + 150);
         this.lastBump = Date.now();
         toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -499,7 +506,8 @@ const host = {
     }
     if (Date.now() - (this.lastFull || 0) > 3000) { this.lastFull = Date.now(); this.lastWire = ''; this.publish(); } // 定期重发，防丢
     // 自动调节：连续 20 秒没有设备卡顿，就把缓冲往下压 20ms（最低 100ms），慢慢找到最低又不卡的值
-    if (H.autoDelay && this.live.running && H.liveDelay > 100 && document.visibilityState === 'visible') {
+    const anyHidden = Object.values(H.devices).some((d) => d.online && d.stats?.hidden);
+    if (H.autoDelay && this.live.running && H.liveDelay > 100 && document.visibilityState === 'visible' && !anyHidden) {
       const now = Date.now();
       this.lastBump = this.lastBump || now;
       this.lastLower = this.lastLower || now;
