@@ -224,7 +224,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
           <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
-          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="120" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
           <label><input type="checkbox" id="opusOn" /> 压缩传输（Opus，省流量；不支持的设备自动用无损）</label>
           <div class="muted">
@@ -3098,7 +3098,7 @@ class Engine extends EventTarget {
     this.liveStats = { got: 0, late: 0, resyncs: 0, err: null };
     this.liveSources = new Set();
     const AC = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new AC({ latencyHint: 'playback' });
+    this.ctx = new AC({ latencyHint: 'interactive' });
     this.master = this.ctx.createGain();
     this.master.connect(this.ctx.destination);
     this.deviceGain = this.ctx.createGain();
@@ -4005,9 +4005,10 @@ const host = {
     if (autoSelf) this.toggleSelf();
     try {
       await this.live.startCapture();
-      if (autoSelf && this.live.surface !== 'browser') {
-        this.toggleSelf(); // 共享整个屏幕时电脑本来就有原声，再出声会有回声
-        toast('共享的是整个屏幕：电脑保持原声，手机会比电脑晚一点（等于缓冲延迟）');
+      if (this.live.surface !== 'browser' && this.selfEngine) {
+        // 共享窗口/整个屏幕时抓的是系统声音：电脑原声不会被静音，本机再出声还会被重新抓进去形成回声
+        this.toggleSelf();
+        toast('你共享的是窗口/整个屏幕：电脑会保留原声，手机比电脑晚一点。想让电脑和手机完全同步，请改为共享 Chrome 标签页');
       }
     } catch (e) {
       if (autoSelf && this.selfEngine) this.toggleSelf();
@@ -4131,6 +4132,9 @@ const host = {
   },
 
   async toggleSelf() {
+    if (!this.selfEngine && this.live.running && this.live.surface !== 'browser') {
+      return toast('正在共享窗口/整个屏幕：本机再出声会被重新抓进去形成回声，所以不能开。改为共享标签页就可以');
+    }
     if (this.selfEngine) {
       this.selfEngine.destroy(); this.selfEngine = null;
       delete H.devices.self;
@@ -4245,8 +4249,9 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && this.live.wantOpus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
+    const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
-      ? `正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
+      ? `共享类型：${surf}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
       : '未在共享';
   },
 

@@ -13,7 +13,7 @@ export class Engine extends EventTarget {
     this.liveStats = { got: 0, late: 0, resyncs: 0, err: null };
     this.liveSources = new Set();
     const AC = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new AC({ latencyHint: 'playback' });
+    this.ctx = new AC({ latencyHint: 'interactive' });
     this.master = this.ctx.createGain();
     this.master.connect(this.ctx.destination);
     this.deviceGain = this.ctx.createGain();

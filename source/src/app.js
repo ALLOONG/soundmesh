@@ -287,9 +287,10 @@ const host = {
     if (autoSelf) this.toggleSelf();
     try {
       await this.live.startCapture();
-      if (autoSelf && this.live.surface !== 'browser') {
-        this.toggleSelf(); // 共享整个屏幕时电脑本来就有原声，再出声会有回声
-        toast('共享的是整个屏幕：电脑保持原声，手机会比电脑晚一点（等于缓冲延迟）');
+      if (this.live.surface !== 'browser' && this.selfEngine) {
+        // 共享窗口/整个屏幕时抓的是系统声音：电脑原声不会被静音，本机再出声还会被重新抓进去形成回声
+        this.toggleSelf();
+        toast('你共享的是窗口/整个屏幕：电脑会保留原声，手机比电脑晚一点。想让电脑和手机完全同步，请改为共享 Chrome 标签页');
       }
     } catch (e) {
       if (autoSelf && this.selfEngine) this.toggleSelf();
@@ -413,6 +414,9 @@ const host = {
   },
 
   async toggleSelf() {
+    if (!this.selfEngine && this.live.running && this.live.surface !== 'browser') {
+      return toast('正在共享窗口/整个屏幕：本机再出声会被重新抓进去形成回声，所以不能开。改为共享标签页就可以');
+    }
     if (this.selfEngine) {
       this.selfEngine.destroy(); this.selfEngine = null;
       delete H.devices.self;
@@ -527,8 +531,9 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && this.live.wantOpus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
+    const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
-      ? `正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
+      ? `共享类型：${surf}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
       : '未在共享';
   },
 
