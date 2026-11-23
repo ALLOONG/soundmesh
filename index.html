@@ -331,7 +331,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
       </section>
 
       <section class="stack">
-        <h2 style="padding:0 4px">📡 设备 <span id="devCount" class="muted"></span></h2>
+        <div class="row" style="padding:0 4px"><h2 style="margin:0">📡 设备 <span id="devCount" class="muted"></span></h2><span class="grow"></span><button class="small" id="clearOffline" hidden>清除离线设备</button></div>
         <div id="devices" class="stack"></div>
         <div id="noDev" class="card muted small">还没有设备加入。让手机扫上面的二维码。</div>
       </section>
@@ -4586,6 +4586,8 @@ function startHost(code, resume) {
   H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
   H.ly = { a: null, s: 0, o: H.ly?.o || 0 };
   if (!saved?.v2) { H.liveDelay = 350; H.autoDelay = true; H.v2 = true; } // 旧版本默认 800ms 太保守
+  // 新建房间：设备从空的开始（只保留曲目和规则设置）；“回到上次的房间”才保留设备、位置和校准
+  if (!resume) { H.devices = {}; H.colorIdx = 0; }
   for (const d of Object.values(H.devices)) d.online = false;
   delete H.devices.self;
   $('#landing').hidden = true;
@@ -4953,6 +4955,12 @@ const host = {
       this.changed();
     };
     $('#roomW').onchange = size; $('#roomH').onchange = size;
+    $('#clearOffline').onclick = () => {
+      const n = Object.values(H.devices).filter((d) => !d.online).length;
+      for (const [id, d] of Object.entries(H.devices)) if (!d.online) delete H.devices[id];
+      toast(n ? `已清除 ${n} 台离线设备` : '没有离线设备');
+      this.changed();
+    };
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.calibrate();
@@ -5417,6 +5425,7 @@ const host = {
     }
     $('#devCount').textContent = `${online.length} 在线`;
     $('#noDev').style.display = devs.length ? 'none' : '';
+    $('#clearOffline').hidden = !devs.some((d) => !d.online);
     const ready = online.filter((d) => (d.id === 'self' ? this.selfEngine?.loadInfo.loaded === this.selfEngine?.loadInfo.needed : d.stats?.ready && d.stats?.unlocked && d.stats?.synced)).length;
     $('#ready').textContent = online.length ? `${ready}/${online.length} 台设备已就绪${ready < online.length ? '（没就绪的设备准备好后会自动跟上）' : ''}` : '';
   },
@@ -5607,7 +5616,9 @@ const node = {
 
   async start(code) {
     this.code = code;
-    try { this.did = sessionStorage.getItem('sm-did') || rid(8); sessionStorage.setItem('sm-did', this.did); } catch { this.did = rid(8); }
+    // 设备编号按浏览器保存：同一台手机重新打开/重新扫码，还是同一台设备（位置、校准结果都沿用）
+    this.did = store.get('sm-did', null) || rid(8);
+    store.set('sm-did', this.did);
     this.name = $('#name').value.trim() || `${TYPE_NAME[detectDeviceType()]} ${String.fromCharCode(65 + Math.floor(Math.random() * 26))}`;
     store.set('sm-name', this.name);
     this.engine = new Engine(this.clock, { fetchFile: (id) => this.fetchFile(id) });
