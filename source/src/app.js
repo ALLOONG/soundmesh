@@ -590,6 +590,8 @@ const host = {
         this.changed();
       }
     }
+    // 给「SoundMesh 画面延后」扩展：把画面该延后多少告诉它（它在 YouTube 页面里把画面往后推）
+    try { window.postMessage({ __soundmesh: 'videoDelay', ms: Math.round(this.mirrorDelay()), live: !!this.live?.running, t: Date.now() }, location.origin); } catch {}
     this.renderTime();
     this.renderLive();
   },
@@ -1039,7 +1041,7 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && H.opus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
-    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · 电脑处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '');
+    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · 电脑处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
       ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`

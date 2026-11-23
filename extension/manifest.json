@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "SoundMesh 画面延后",
+  "version": "1.0.0",
+  "description": "在 YouTube 里把画面自动延后，和 SoundMesh 连接的手机/平板声音对齐。原画质，照常操作。",
+  "permissions": ["storage"],
+  "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" },
+  "action": { "default_popup": "popup.html", "default_title": "SoundMesh 画面延后" },
+  "content_scripts": [
+    {
+      "matches": ["https://alloong.github.io/soundmesh/*", "http://localhost/*", "http://127.0.0.1/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*", "https://music.youtube.com/*"],
+      "js": ["delay.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
