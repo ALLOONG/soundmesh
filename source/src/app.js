@@ -179,7 +179,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, mirrorOffset: 0, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -251,16 +251,7 @@ const host = {
       $('#diagOut').hidden = false; $('#diagOut').value = txt;
       navigator.clipboard?.writeText(txt).then(() => toast('诊断记录已复制，直接粘贴给 Claude 就行'), () => toast('自动复制失败：请在下面的框里全选后复制'));
     };
-    // 控制端被最小化/切到别的软件时：先把缓冲加大到至少 800ms（画面用“同步画面”跟着延后），回到前台再恢复
-    document.addEventListener('visibilitychange', () => {
-      if (!H.autoDelay) return;
-      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 800) {
-        this.boostFrom = H.liveDelay; H.liveDelay = 800; this.lastBump = Date.now(); this.changed();
-      } else if (document.visibilityState === 'visible' && this.boostFrom) {
-        if (H.liveDelay === 800) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
-        this.boostFrom = null; this.changed();
-      }
-    });
+    // （不再因为控制端切到后台就加大缓冲：采集改为排队读取后不会丢声音，真来不及时由“处理延迟”检测自动加大）
   },
 
   setCode(code) {
@@ -408,8 +399,9 @@ const host = {
     if (now - (this.lagWin || 0) > 2000) {
       this.lagShown = this.lagMax; this.lagMax = 0; this.lagWin = now;
       // 处理延迟已经吃掉大部分缓冲 → 自动加大（留 150ms 给网络和手机）
-      if (H.autoDelay && this.lagShown + 150 > H.liveDelay && H.liveDelay < 3000) {
-        H.liveDelay = Math.min(3000, Math.ceil((this.lagShown + 200) / 50) * 50);
+      const margin = H.videoMode ? 40 : 150; // 看视频模式：只给网络和手机留 40ms
+      if (H.autoDelay && this.lagShown + margin > H.liveDelay && H.liveDelay < 3000) {
+        H.liveDelay = Math.min(3000, Math.ceil((this.lagShown + margin + 30) / 10) * 10);
         this.lastBump = now;
         toast(`电脑处理跟不上（慢了 ${Math.round(this.lagShown)} ms），缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -580,15 +572,17 @@ const host = {
       this.changed();
     }
     if (Date.now() - (this.lastFull || 0) > 3000) { this.lastFull = Date.now(); this.lastWire = ''; this.publish(); } // 定期重发，防丢
-    // 自动调节：连续 20 秒没有设备卡顿，就把缓冲往下压 20ms（最低 100ms），慢慢找到最低又不卡的值
+    // 自动调节：一段时间没有设备卡顿，就把缓冲往下压，慢慢找到最低又不卡的值。
+    // 看视频模式更积极：6 秒没卡就降 20ms，最低 80ms（声音只比画面晚一点点）
     const anyHidden = Object.values(H.devices).some((d) => d.online && d.stats?.hidden);
-    if (H.autoDelay && this.live.running && H.liveDelay > 100 && document.visibilityState === 'visible' && !anyHidden) {
+    const floor = H.videoMode ? 80 : 100, calm = H.videoMode ? 6000 : 20000, every = H.videoMode ? 4000 : 10000;
+    if (H.autoDelay && this.live.running && H.liveDelay > floor && !anyHidden) {
       const now = Date.now();
       this.lastBump = this.lastBump || now;
       this.lastLower = this.lastLower || now;
-      if (now - this.lastBump > 20000 && now - this.lastLower > 10000) {
+      if (now - this.lastBump > calm && now - this.lastLower > every) {
         this.lastLower = now;
-        H.liveDelay = Math.max(100, H.liveDelay - 20);
+        H.liveDelay = Math.max(floor, H.liveDelay - (H.videoMode ? 10 : 20)); // 小步下调，设备用微调速度平滑跟上，不会断
         this.changed();
       }
     }
@@ -639,6 +633,16 @@ const host = {
     $('#autoDelay').onchange = (e) => { H.autoDelay = e.target.checked; this.changed(); };
     $('#liveStems').onchange = (e) => this.setLiveStems(e.target.checked);
     $('#mirrorBtn').onclick = () => this.toggleMirror();
+    $('#videoMode').onchange = (e) => {
+      H.videoMode = e.target.checked;
+      if (H.videoMode) {
+        H.autoDelay = true;
+        if (H.liveDelay > 200) H.liveDelay = 200; // 先直接降到 200ms，再自动往下找
+        this.lastBump = Date.now() - 6000; this.lastLower = 0;
+        if (H.liveStems) toast('提示：看视频模式下建议关掉“实时拆声部”，它会多出约 70ms 延迟');
+      }
+      this.changed();
+    };
     $('#mirrorClose').onclick = () => this.toggleMirror(false);
     $('#mirrorFull').onclick = () => $('#mirrorBox').requestFullscreen?.().catch(() => toast('无法全屏'));
     $('#mirrorOffset').oninput = (e) => { H.mirrorOffset = Number(e.target.value); this.changed(); };
@@ -1024,6 +1028,7 @@ const host = {
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
     $('#liveStems').checked = !!H.liveStems;
+    $('#videoMode').checked = !!H.videoMode;
     if (document.activeElement !== $('#mirrorOffset')) $('#mirrorOffset').value = H.mirrorOffset || 0;
     $('#mirrorOffsetVal').textContent = `${(H.mirrorOffset || 0) > 0 ? '+' : ''}${H.mirrorOffset || 0} ms`;
     $('#mirrorInfo').textContent = `画面延后 ${Math.round(this.mirrorDelay())} ms，和手机的声音对齐`;
