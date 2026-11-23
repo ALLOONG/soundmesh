@@ -1,5 +1,6 @@
 // 播放引擎：解码/合成音频、把“控制端时钟”换算成 AudioContext 时间、精确调度、漂移修正
 import { synthBuffer } from './synth.js';
+import { makeChirp } from './calib.js';
 
 const DRIFT_LIMIT_MS = 35;
 const START_LEAD_MS = 150;
@@ -58,6 +59,32 @@ export class Engine extends EventTarget {
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
     o.connect(g).connect(this.master);
     o.start(t); o.stop(t + 0.4);
+  }
+
+  // 校准期间先把音乐静音，避免干扰录音
+  duck(untilClockMs) {
+    const t = this.ctx.currentTime, end = Math.max(t, this.clockToCtx(untilClockMs));
+    this.duckUntil = end;
+    const g = this.deviceGain.gain;
+    g.cancelScheduledValues(t); g.setTargetAtTime(0, t, 0.03);
+    g.setTargetAtTime(this.cur?.plan?.gain ?? 1, end, 0.1);
+  }
+
+  // 校准用：在控制端时间 at（再加本机当前的总延迟，和放音乐时一样）播放一声“啾”
+  playChirpAt(at) {
+    if (!this.unlocked) return false;
+    if (!this.chirpBuf) {
+      const c = makeChirp(this.ctx.sampleRate);
+      this.chirpBuf = this.ctx.createBuffer(1, c.length, this.ctx.sampleRate);
+      this.chirpBuf.copyToChannel(c, 0);
+    }
+    const when = this.clockToCtx(at + (this.cur?.plan?.D || 0));
+    if (when < this.ctx.currentTime + 0.01) return false;
+    const s = this.ctx.createBufferSource(), g = this.ctx.createGain();
+    s.buffer = this.chirpBuf; g.gain.value = 0.9;
+    s.connect(g).connect(this.master);
+    s.start(when);
+    return true;
   }
 
   // ---------- 音频来源 ----------
@@ -275,7 +302,7 @@ export class Engine extends EventTarget {
 
   updateParams(plan) {
     const t = this.ctx.currentTime;
-    this.deviceGain.gain.setTargetAtTime(plan.gain, t, 0.04);
+    if (!(this.duckUntil > t)) this.deviceGain.gain.setTargetAtTime(plan.gain, t, 0.04);
     for (const v of [...this.voices, ...this.liveVoices]) {
       const s = plan.sources[v.idx];
       if (!s) continue;

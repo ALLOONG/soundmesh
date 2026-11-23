@@ -4,6 +4,7 @@ import { Engine } from './engine.js';
 import { BUILTIN_GROUPS } from './synth.js';
 import { HostLink, NodeLink, packBin } from './transport.js';
 import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode } from './live.js';
+import { MicRecorder, detectChirps, median } from './calib.js';
 
 // ---------------- 小工具 ----------------
 const $ = (s, el = document) => el.querySelector(s);
@@ -104,7 +105,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true,
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true,
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -203,6 +204,7 @@ const host = {
       const late = msg.stats?.live?.late;
       if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 1500) {
         H.liveDelay = Math.min(1500, H.liveDelay + 50);
+        this.lastBump = Date.now();
         toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
       }
@@ -213,6 +215,9 @@ const host = {
       if (Number.isFinite(msg.latencyMs)) d.latencyMs = Math.max(-1000, Math.min(1000, msg.latencyMs));
       this.changed();
     } else if (msg.t === 'getFile') this.sendFile(c, String(msg.id));
+    else if (['micReady', 'micErr', 'measureResult'].includes(msg.t) && this.calWait && c.did === this.calWait.did) {
+      const w = this.calWait; this.calWait = null; w.resolve(msg);
+    }
   },
 
   onPeers() {
@@ -283,7 +288,7 @@ const host = {
     if (this.live.running) return this.live.stop();
     // 必须在这次点击里先启用本机声音（浏览器要求声音由点击触发）；
     // 共享的是标签页时电脑原声会被静音，电脑就改为和手机一起同步出声
-    const autoSelf = !this.selfEngine;
+    const autoSelf = !this.selfEngine && H.pcPlay !== false;
     if (autoSelf) this.toggleSelf();
     try {
       await this.live.startCapture();
@@ -350,6 +355,17 @@ const host = {
       this.changed();
     }
     if (Date.now() - (this.lastFull || 0) > 3000) { this.lastFull = Date.now(); this.lastWire = ''; this.publish(); } // 定期重发，防丢
+    // 自动调节：连续 20 秒没有设备卡顿，就把缓冲往下压 20ms（最低 100ms），慢慢找到最低又不卡的值
+    if (H.autoDelay && this.live.running && H.liveDelay > 100) {
+      const now = Date.now();
+      this.lastBump = this.lastBump || now;
+      this.lastLower = this.lastLower || now;
+      if (now - this.lastBump > 20000 && now - this.lastLower > 10000) {
+        this.lastLower = now;
+        H.liveDelay = Math.max(100, H.liveDelay - 20);
+        this.changed();
+      }
+    }
     this.renderTime();
     this.renderLive();
   },
@@ -392,6 +408,13 @@ const host = {
     $('#liveBtn').onclick = () => this.toggleLive();
     $('#liveDelay').oninput = (e) => { H.liveDelay = Number(e.target.value); this.changed(); };
     $('#autoDelay').onchange = (e) => { H.autoDelay = e.target.checked; this.changed(); };
+    $('#pcPlay').onchange = (e) => {
+      H.pcPlay = e.target.checked;
+      // 正在共享时立刻生效
+      if (this.live.running && !H.pcPlay && this.selfEngine) this.toggleSelf();
+      else if (this.live.running && H.pcPlay && !this.selfEngine && this.live.surface === 'browser') this.toggleSelf();
+      this.changed();
+    };
     $('#opusOn').onchange = (e) => { H.opus = e.target.checked; this.updateOpusWant(); this.changed(); };
     $$('#modeSeg button').forEach((b) => (b.onclick = () => { H.mode = b.dataset.mode; this.changed(); }));
     $$('[data-opt]').forEach((c) => (c.onchange = () => { H.options[c.dataset.opt] = c.checked; this.changed(); }));
@@ -409,8 +432,92 @@ const host = {
     $('#roomW').onchange = size; $('#roomH').onchange = size;
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
+    $('#calibBtn').onclick = () => this.calibrate();
+    $('#calibUndo').onclick = () => {
+      if (!this.calUndo) return;
+      for (const [id, v] of Object.entries(this.calUndo)) if (H.devices[id]) H.devices[id].latencyMs = v;
+      this.calUndo = null; $('#calibUndo').hidden = true; $('#calibOut').innerHTML = '已撤销校准';
+      this.changed();
+    };
     $('#selfNode').onclick = () => this.toggleSelf();
     this.bindCanvas();
+  },
+
+  // ---------- 麦克风自动校准 ----------
+  waitFor(did, ms) {
+    return new Promise((resolve) => {
+      this.calWait = { did, resolve };
+      setTimeout(() => { if (this.calWait?.resolve === resolve) { this.calWait = null; resolve(null); } }, ms);
+    });
+  },
+  async calibrate() {
+    if (this.calibrating) return;
+    const out = (h) => ($('#calibOut').innerHTML = h);
+    const micId = $('#calibMic').value;
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (!devs.length) return toast('还没有在线的播放设备');
+    const client = micId === 'self' ? null : [...this.link?.clients.values() || []].find((c) => c.did === micId);
+    if (micId !== 'self' && !client) return toast('选的录音设备不在线');
+    this.calibrating = true; $('#calibBtn').disabled = true;
+    let recorder = null;
+    try {
+      // 1) 先打开麦克风（第一次会弹出权限询问）
+      out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
+      if (micId === 'self') {
+        const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
+        recorder = new MicRecorder(ctx, hostNow);
+        await recorder.start();
+      } else {
+        this.link.send(client, { t: 'micPrep' });
+        const r = await this.waitFor(micId, 30000);
+        if (!r || r.t !== 'micReady') throw new Error(r?.msg ? '录音设备无法使用麦克风：' + r.msg : '录音设备没有回应（请在那台手机上允许麦克风）');
+      }
+      // 2) 安排每台设备轮流“啾”3 轮
+      const gap = 900, rounds = 3, n = devs.length, T0 = hostNow() + 1200;
+      const slots = [];
+      for (let r = 0; r < rounds; r++) devs.forEach((d, i) => slots.push({ did: d.id, at: T0 + (r * n + i) * gap }));
+      for (const d of devs) {
+        const at = slots.filter((x) => x.did === d.id).map((x) => x.at);
+        if (d.id === 'self') { this.selfEngine.duck(at[at.length - 1] + 1200); at.forEach((t) => this.selfEngine.playChirpAt(t)); }
+        else for (const c of this.link.clients.values()) if (c.did === d.id) this.link.send(c, { t: 'chirp', at, until: slots[slots.length - 1].at + 1200 });
+      }
+      const end = slots[slots.length - 1].at + 900;
+      out(`🔊 校准中，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
+      let results;
+      if (recorder) {
+        await sleep(end - hostNow());
+        out('🧮 分析录音中…');
+        await sleep(30);
+        results = detectChirps(recorder.stop(), slots);
+        recorder = null;
+      } else {
+        this.link.send(client, { t: 'measure', end, slots });
+        const r = await this.waitFor(micId, end - hostNow() + 20000);
+        if (!r || r.t !== 'measureResult') throw new Error('录音设备没有返回结果');
+        results = r.results;
+      }
+      // 3) 计算每台设备的偏差（取中位数），以所有设备的中位数为基准对齐
+      const rows = devs.map((d) => {
+        const ok = results.filter((x) => x.did === d.id && x.ok).map((x) => x.err);
+        // 3 次结果要互相吻合（相差 15ms 以内）才算数，防止把别的声音误认成“啾”
+        const med = ok.length >= 2 ? median(ok) : null;
+        const agree = ok.filter((e) => med !== null && Math.abs(e - med) < 15).length;
+        return { d, n: agree, med: agree >= 2 ? med : null };
+      });
+      const valid = rows.filter((r) => r.med !== null);
+      if (!valid.length) throw new Error('没有录到清楚的“啾”声：把录音设备放近一点、把音量调大、保持安静再试');
+      const ref = median(valid.map((r) => r.med));
+      this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
+      for (const r of valid) r.d.latencyMs = Math.max(-1000, Math.min(1000, Math.round(r.d.latencyMs - (r.med - ref))));
+      out(`✅ 校准完成（每台设备取 3 次中位数）：<table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td><td>${r.med === null ? `<span style="color:var(--bad)">没听清（${r.n}/3）</span>` : `${r.med - ref > 0 ? '晚' : '早'} ${Math.abs(r.med - ref).toFixed(0)} ms`}</td><td>${r.med === null ? '未调整' : `微调 → ${r.d.latencyMs} ms`}</td></tr>`).join('')}</table>`);
+      $('#calibUndo').hidden = false;
+      this.changed();
+    } catch (e) {
+      out('❌ ' + esc(e.message || String(e)));
+    } finally {
+      if (recorder) try { recorder.stop(); } catch {}
+      this.calibrating = false; $('#calibBtn').disabled = false;
+    }
   },
 
   async toggleSelf() {
@@ -528,6 +635,7 @@ const host = {
     $('#liveDelayVal').textContent = `${H.liveDelay} ms`;
     $('#opusOn').checked = H.opus;
     $('#autoDelay').checked = H.autoDelay;
+    $('#pcPlay').checked = H.pcPlay !== false;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && this.live.wantOpus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
@@ -635,6 +743,13 @@ const host = {
       this.updateCard(c, d, plans[d.id]);
     });
     const online = devs.filter((d) => d.online);
+    const micSig = online.map((d) => d.id + d.name).join('|');
+    if (micSig !== this.micSig) {
+      this.micSig = micSig;
+      const sel = $('#calibMic'), cur = sel.value;
+      sel.innerHTML = '<option value="self">这台电脑的麦克风</option>' + online.filter((d) => d.id !== 'self').map((d) => `<option value="${esc(d.id)}">${esc(d.name)} 的麦克风</option>`).join('');
+      if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+    }
     $('#devCount').textContent = `${online.length} 在线`;
     $('#noDev').style.display = devs.length ? 'none' : '';
     const ready = online.filter((d) => (d.id === 'self' ? this.selfEngine?.loadInfo.loaded === this.selfEngine?.loadInfo.needed : d.stats?.ready && d.stats?.unlocked && d.stats?.synced)).length;
@@ -865,6 +980,24 @@ const node = {
     } else if (m.t === 'beep') {
       this.engine.beep();
       const el = $('#nodeMain'); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    } else if (m.t === 'chirp' && Array.isArray(m.at)) {
+      if (m.until) this.engine.duck(m.until);
+      m.at.forEach((t) => this.engine.playChirpAt(t));
+    } else if (m.t === 'micPrep') {
+      (async () => {
+        try {
+          this.rec = new MicRecorder(this.engine.ctx, () => this.clock.now());
+          await this.rec.start();
+          this.link.send({ t: 'micReady' });
+        } catch (e) { this.rec = null; this.link.send({ t: 'micErr', msg: e.message || String(e) }); }
+      })();
+    } else if (m.t === 'measure' && this.rec) {
+      (async () => {
+        await sleep(Math.max(0, m.end - this.clock.now()));
+        const rec = this.rec; this.rec = null;
+        const results = detectChirps(rec.stop(), m.slots).map((r) => ({ did: r.did, err: r.err, ok: r.ok }));
+        this.link.send({ t: 'measureResult', results });
+      })();
     } else if (m.t === 'fileErr') {
       const f = this.files.get(m.id);
       if (f && !f.done) { f.reject(new Error('控制端找不到这个文件（控制端刷新后需要重新添加）')); this.files.delete(m.id); }

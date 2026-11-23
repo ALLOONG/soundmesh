@@ -92,6 +92,7 @@
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
           <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <label><input type="checkbox" id="pcPlay" /> 电脑也出声（关掉 = 只有手机/平板出声，电脑静音）</label>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
           <label><input type="checkbox" id="opusOn" /> 压缩传输（Opus，省流量；不支持的设备自动用无损）</label>
           <div class="muted">
@@ -104,6 +105,15 @@
         </div>
         <div class="row small"><span>总音量</span><input type="range" id="master" min="0" max="1.5" step="0.01" class="grow" style="width:auto" /><span id="masterVal"></span></div>
         <div id="ready" class="small muted"></div>
+      </section>
+
+      <section class="card stack">
+        <h2>🎯 自动校准（让所有设备同时出声）</h2>
+        <div class="small muted">每台设备会轮流发出“啾”声，由一个麦克风在<b>听众位</b>录下来，自动算出每台设备快了还是慢了多少，再填进它的“延迟微调”。蓝牙音箱、不同手机的扬声器延迟都能这样校准。</div>
+        <div class="row small"><span>录音设备</span><select id="calibMic" class="grow"></select></div>
+        <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
+        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="calibUndo" class="small" hidden>撤销</button></div>
+        <div id="calibOut" class="small"></div>
       </section>
 
       <section class="card stack">
