@@ -228,6 +228,10 @@ const host = {
     this.live.addEventListener('chunk', (e) => this.onLiveChunk(e.detail));
     this.live.addEventListener('state', (e) => this.onLiveState(e.detail));
     setInterval(() => this.tick(), 500);
+    window.addEventListener('message', (e) => {
+      const d = e.data;
+      if (e.source === window && d && d.__soundmesh === 'tabStream' && d.id) this.startTabFromExt(d.id, d.title);
+    });
     window.smHost = this; // 调试用
     // 诊断记录：每秒一条，保留 2 分钟
     setInterval(() => {
@@ -496,6 +500,18 @@ const host = {
     this.updateOpusWant();
     this.libSig = null;
     this.changed();
+  },
+  // 扩展送来的分页声音（在 YouTube 分页点扩展图标 →「把这个分页的声音送到 SoundMesh」）
+  async startTabFromExt(id, title) {
+    const autoSelf = !this.selfEngine && H.pcPlay !== false;
+    if (autoSelf) this.toggleSelf();
+    try {
+      await this.live.startFromTabId(id);
+      toast(`🎞️ 已经开始播放「${(title || '分页').slice(0, 40)}」的声音（由扩展抓取，不会出现共享提示条）`);
+    } catch (e) {
+      if (autoSelf && this.selfEngine) this.toggleSelf();
+      toast('扩展抓声音失败：' + (e.message || e.name || e));
+    }
   },
   async toggleLive() {
     if (this.live.running) return this.live.stop();

@@ -56,6 +56,15 @@ export class LiveCapture extends EventTarget {
     return this.startFromStream(stream);
   }
 
+  // 由「SoundMesh 画面延后」扩展抓分页声音（不弹共享窗口，也不会出现“正在共享此标签页”的提示条）
+  async startFromTabId(id) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: id } }, video: false,
+    });
+    this.surface = 'browser';
+    return this.startFromStream(stream);
+  }
+
   async startFromStream(stream) {
     await this.stop();
     this.stream = stream;
