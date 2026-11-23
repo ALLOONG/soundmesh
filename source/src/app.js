@@ -3,8 +3,10 @@ import { computeMix, assignLabel, assignOptions, guessRole } from './mix.js';
 import { Engine } from './engine.js';
 import { BUILTIN_GROUPS } from './synth.js';
 import { HostLink, NodeLink, packBin } from './transport.js';
-import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode } from './live.js';
-import { MicRecorder, detectChirps, median } from './calib.js';
+import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder } from './live.js';
+import { Separator, STEMS, STEM_NAMES } from './separator.js';
+import { searchLyrics, parseLRC, lineAt } from './lyrics.js';
+import { MicRecorder, detectChirps, median, analyzeWindows } from './calib.js';
 
 // ---------------- 小工具 ----------------
 const $ = (s, el = document) => el.querySelector(s);
@@ -47,10 +49,47 @@ const TYPE_ICON = { phone: '📱', tablet: '📟', computer: '💻' };
 const TYPE_NAME = { phone: '手机', tablet: '平板', computer: '电脑' };
 const COLORS = ['#ff6b6b', '#4dabf7', '#51cf66', '#fcc419', '#cc5de8', '#ff922b', '#20c997', '#f06595', '#94d82d', '#748ffc'];
 const PB_CODE = { stopped: 0, playing: 1, paused: 2 }, PB_NAME = ['stopped', 'playing', 'paused'];
-const LIVE_GROUP = {
-  id: 'live', name: '电脑实时音源（YouTube / Spotify…）', kind: 'live', loop: false, duration: 0,
-  tracks: [{ id: 'live', name: '实时音频', src: 'live', channels: 2, duration: 0, role: 'other' }],
-};
+// 实时音源：完整混音 + （开启拆声部时）四个声部
+function liveGroup(stems) {
+  const tracks = [{ id: 'live', name: '完整混音', src: 'live', channels: 2, duration: 0, role: 'mix' }];
+  if (stems) for (const st of STEMS) tracks.push({ id: 'lv-' + st, name: STEM_NAMES[st], src: 'live:' + st, channels: 1, duration: 0, role: st });
+  return { id: 'live', name: '电脑实时音源（YouTube / Spotify…）', kind: 'live', loop: false, duration: 0, tracks };
+}
+// 歌曲当前位置（秒），用于歌词滚动。ly = { a, s, o }：实时音源用“点一句对准”的锚点，文件用播放进度 + 偏移
+function songPos(t, cur, ly) {
+  if (!cur || !ly) return null;
+  const { pb, group } = cur;
+  if (group?.kind === 'live') return ly.a == null ? null : ly.s + (t - ly.a) / 1000 + (ly.o || 0);
+  if (!pb) return null;
+  let p = pb.status === 'playing' ? Math.max(pb.o, pb.o + (t - pb.S) / 1000) : pb.o;
+  if (group?.loop && group.duration) p %= group.duration;
+  return p + (ly.o || 0);
+}
+function renderLyricLines(box, lines, idx, clickable) {
+  if (box.__lines !== lines) {
+    box.__lines = lines;
+    box.innerHTML = lines.map((l, i) => `<div class="ly-line" data-i="${i}">${esc(l.text) || '♪'}</div>`).join('');
+    box.__idx = -2;
+    if (clickable) $$('.ly-line', box).forEach((el) => (el.onclick = () => clickable(Number(el.dataset.i))));
+  }
+  if (box.__idx === idx) return;
+  box.__idx = idx;
+  $$('.ly-line.on', box).forEach((el) => el.classList.remove('on'));
+  const el = box.children[idx];
+  if (el) { el.classList.add('on'); box.scrollTo({ top: el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2, behavior: 'smooth' }); }
+}
+function renderLyricStrip(box, lines, idx, hint) {
+  if (!lines?.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const cur = lines[idx]?.text, next = lines[idx + 1]?.text ?? (idx < 0 ? lines[0]?.text : '');
+  const key = idx + '|' + hint;
+  if (box.__key === key) return;
+  box.__key = key;
+  box.innerHTML = idx < 0
+    ? `<div class="ly-cur muted">${esc(hint || '♪')}</div><div class="ly-next">${esc(next || '')}</div>`
+    : `<div class="ly-cur">${esc(cur || '♪')}</div><div class="ly-next">${esc(next || '')}</div>`;
+}
+
 const pageUrl = () => location.origin + location.pathname + (new URLSearchParams(location.search).get('peer') ? `?peer=${new URLSearchParams(location.search).get('peer')}&` : '?');
 
 // 音频文件存在浏览器的 IndexedDB 里，刷新后还在
@@ -105,7 +144,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true,
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, pcPlay: true, liveStems: false, lyrics: null, ly: { a: null, s: 0, o: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -113,9 +152,10 @@ function defaultHostState(code) {
 function startHost(code, resume) {
   const saved = store.get('sm-host-state', null);
   H = saved ? { ...defaultHostState(code), ...saved, code } : defaultHostState(code);
-  H.library = [structuredClone(LIVE_GROUP), ...structuredClone(BUILTIN_GROUPS), ...(H.library || []).filter((g) => g.kind === 'file')];
+  H.library = [liveGroup(H.liveStems), ...structuredClone(BUILTIN_GROUPS), ...(H.library || []).filter((g) => g.kind === 'file')];
   if (!H.library.some((g) => g.id === H.currentGroupId) || H.currentGroupId === 'live') H.currentGroupId = 'demo-mix';
   H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
+  H.ly = { a: null, s: 0, o: H.ly?.o || 0 };
   if (!saved?.v2) { H.liveDelay = 350; H.autoDelay = true; H.v2 = true; } // 旧版本默认 800ms 太保守
   for (const d of Object.values(H.devices)) d.online = false;
   delete H.devices.self;
@@ -126,7 +166,7 @@ function startHost(code, resume) {
 
 const host = {
   link: null, selfEngine: null, lastWire: '', pubTimer: null, selected: null, files: new Map(), sending: new Set(),
-  live: new LiveCapture(hostNow),
+  live: new LiveCapture(hostNow), sep: null, encoders: new Map(), need: {},
 
   init(code, resume) {
     this.setCode(code);
@@ -148,7 +188,6 @@ const host = {
     this.link.addEventListener('msg', (e) => this.onMsg(e.detail));
     this.link.addEventListener('peers', () => this.onPeers());
     this.live.addEventListener('chunk', (e) => this.onLiveChunk(e.detail));
-    this.live.addEventListener('opus', (e) => this.onLiveOpus(e.detail));
     this.live.addEventListener('state', (e) => this.onLiveState(e.detail));
     setInterval(() => this.tick(), 500);
     window.smHost = this; // 调试用
@@ -193,6 +232,7 @@ const host = {
       }
       d.stats = {};
       this.onPeers();
+      if (H.lyrics) this.link.send(c, { t: 'lyrics', ly: H.lyrics });
       this.lastWire = ''; // 新设备：马上发一次完整状态
       this.publish();
     } else if (msg.t === 'ping') {
@@ -250,32 +290,58 @@ const host = {
   },
 
   // ---------- 实时音源 ----------
-  updateOpusWant() {
-    const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
-    this.live.wantOpus = H.opus && clients.some((c) => c.opus);
-  },
-  onLiveChunk({ ts, l, r }) {
+  updateOpusWant() {},
+  needs(did, src) { return !!this.need[did]?.has(src); },
+  anyNeeds(src) { return Object.values(this.need).some((set) => set.has(src)); },
+  onLiveChunk({ frame, ts, l, r }) {
     if (H.currentGroupId !== 'live') return;
-    if (this.selfEngine) {
-      const ctx = this.selfEngine.ctx, buf = ctx.createBuffer(2, l.length, 48000);
-      buf.copyToChannel(l, 0); buf.copyToChannel(r, 1);
-      this.selfEngine.pushLive(ts, buf);
+    this.dispatch('live', ts, [l, r]);
+    // 拆声部：只有当有设备需要某个声部时才运行
+    if (H.liveStems && STEMS.some((st) => this.anyNeeds('live:' + st))) {
+      this.sep = this.sep || new Separator(48000, 960);
+      for (const o of this.sep.push(frame, l, r)) {
+        const ts2 = this.live.tsOf(o.frame);
+        for (const st of STEMS) this.dispatch('live:' + st, ts2, [o.stems[st]]);
+      }
+    } else this.sep = null;
+  },
+  dispatch(src, ts, planes) {
+    if (this.selfEngine && this.needs('self', src)) {
+      const ctx = this.selfEngine.ctx, buf = ctx.createBuffer(planes.length, planes[0].length, 48000);
+      planes.forEach((p, i) => buf.copyToChannel(p, i));
+      this.selfEngine.pushLive(ts, buf, src);
     }
-    let pcm = null;
+    let pcm = null, wantOpus = false;
     for (const c of this.link?.clients.values() || []) {
-      if (!c.did || (c.opus && this.live.wantOpus)) continue;
+      if (!c.did || !this.needs(c.did, src)) continue;
+      if (H.opus && c.opus && this.encoderFor(src, planes.length).ok) { wantOpus = true; continue; }
       if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; } // 网络跟不上：丢这一段
-      pcm = pcm || pcmEncode(l, r);
-      this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000 }, pcm));
+      pcm = pcm || pcmEncode(planes);
+      this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: planes.length, s: src }, pcm));
     }
+    if (wantOpus) this.encoderFor(src, planes.length).encode(ts, planes);
   },
-  onLiveOpus({ ts, data }) {
-    if (H.currentGroupId !== 'live') return;
-    for (const c of this.link?.clients.values() || []) {
-      if (!c.did || !c.opus) continue;
-      if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
-      this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o' }, data));
+  encoderFor(src, ch) {
+    let e = this.encoders.get(src);
+    if (!e) {
+      e = new StreamEncoder(ch, (ts, data) => {
+        for (const c of this.link?.clients.values() || []) {
+          if (!c.did || !c.opus || !H.opus || !this.needs(c.did, src)) continue;
+          if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
+          this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: src }, data));
+        }
+      });
+      this.encoders.set(src, e);
     }
+    return e;
+  },
+  setLiveStems(on) {
+    H.liveStems = on;
+    H.library[0] = liveGroup(on);
+    this.sep = null;
+    if (on && H.currentGroupId === 'live' && H.mode !== 'split') { H.mode = 'split'; toast('已切换到“声音分工”模式，各设备按位置分配人声/鼓/贝斯/伴奏'); }
+    this.libSig = null;
+    this.changed();
   },
   onLiveState(on) {
     if (on) { H.currentGroupId = 'live'; H.playback = { status: 'playing', startServerTime: hostNow(), startOffset: 0 }; }
@@ -325,7 +391,7 @@ const host = {
   wire(plans) {
     const g = this.group(), pb = H.playback;
     const w = {
-      v: 1, ep: EPOCH, ld: H.liveDelay, pb: [PB_CODE[pb.status], Math.round(pb.startServerTime), r3(pb.startOffset)], m: H.mode === 'split' ? 1 : 0,
+      v: 1, ep: EPOCH, ld: H.liveDelay, ly: H.lyrics ? { id: H.lyrics.id, a: H.ly.a, s: H.ly.s, o: H.ly.o } : null, pb: [PB_CODE[pb.status], Math.round(pb.startServerTime), r3(pb.startOffset)], m: H.mode === 'split' ? 1 : 0,
       g: g ? { id: g.id, k: g.kind, n: g.name.slice(0, 60), l: g.loop ? 1 : 0, d: r3(g.duration || 0), t: g.tracks.map((t) => [t.src, t.channels]) } : null,
       p: {},
     };
@@ -340,7 +406,11 @@ const host = {
   },
 
   publish() {
-    const w = this.wire(this.plans());
+    const plans = this.plans();
+    const g = this.group();
+    this.need = {};
+    for (const [did, pl] of Object.entries(plans)) this.need[did] = new Set(pl.sources.map((x) => g?.tracks.find((t) => t.id === x.trackId)?.src).filter(Boolean));
+    const w = this.wire(plans);
     if (this.selfEngine) this.selfEngine.update(decodeWire(w, 'self'));
     const s = JSON.stringify(w);
     if (s === this.lastWire || !this.link) return;
@@ -394,6 +464,8 @@ const host = {
     if (id === H.currentGroupId) return;
     if (this.live.running && id !== 'live') this.live.stop();
     H.currentGroupId = id;
+    H.ly = { a: null, s: 0, o: 0 };
+    if (!$('#lyQ').value || this.lyAutoQ === $('#lyQ').value) { const g = H.library.find((x) => x.id === id); this.lyAutoQ = g && g.kind === 'file' ? g.name : ''; $('#lyQ').value = this.lyAutoQ; }
     H.playback = id === 'live' && this.live.running ? { status: 'playing', startServerTime: hostNow(), startOffset: 0 } : { status: 'stopped', startServerTime: 0, startOffset: 0 };
     this.changed();
   },
@@ -408,6 +480,7 @@ const host = {
     $('#liveBtn').onclick = () => this.toggleLive();
     $('#liveDelay').oninput = (e) => { H.liveDelay = Number(e.target.value); this.changed(); };
     $('#autoDelay').onchange = (e) => { H.autoDelay = e.target.checked; this.changed(); };
+    $('#liveStems').onchange = (e) => this.setLiveStems(e.target.checked);
     $('#pcPlay').onchange = (e) => {
       H.pcPlay = e.target.checked;
       // 正在共享时立刻生效
@@ -433,6 +506,13 @@ const host = {
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.calibrate();
+    $('#checkBtn').onclick = () => this.checkAssign();
+    $('#lySearch').onclick = () => this.lySearch();
+    $('#lyQ').onkeydown = (e) => e.key === 'Enter' && this.lySearch();
+    $('#lyEarly').onclick = () => { H.ly.o = Math.round((H.ly.o + 0.3) * 10) / 10; this.changed(); };
+    $('#lyLate').onclick = () => { H.ly.o = Math.round((H.ly.o - 0.3) * 10) / 10; this.changed(); };
+    $('#lyClear').onclick = () => { H.lyrics = null; H.ly = { a: null, s: 0, o: 0 }; this.link?.broadcast({ t: 'lyrics', ly: null }); this.changed(); };
+    setInterval(() => this.renderLyrics(), 150);
     $('#calibUndo').onclick = () => {
       if (!this.calUndo) return;
       for (const [id, v] of Object.entries(this.calUndo)) if (H.devices[id]) H.devices[id].latencyMs = v;
@@ -450,6 +530,121 @@ const host = {
       setTimeout(() => { if (this.calWait?.resolve === resolve) { this.calWait = null; resolve(null); } }, ms);
     });
   },
+  // ---------- 歌词 ----------
+  async lySearch() {
+    const q = $('#lyQ').value.trim();
+    if (!q) return toast('输入歌名（最好加上歌手）');
+    $('#lyResults').innerHTML = '<div class="muted small">搜索中…</div>';
+    try {
+      const list = await searchLyrics(q);
+      if (!list.length) { $('#lyResults').innerHTML = '<div class="muted small">没找到，换个写法试试（比如英文歌名 + 歌手）</div>'; return; }
+      this.lyList = list;
+      $('#lyResults').innerHTML = list.map((x, i) => `<div class="lib-item" data-i="${i}"><span class="name">${esc(x.title)} <span class="muted">— ${esc(x.artist)}</span></span><span class="muted small">${x.synced ? '⏱ 同步' : '纯文本'} · ${fmt(x.duration || 0)}</span></div>`).join('');
+      $$('#lyResults .lib-item').forEach((el) => (el.onclick = () => this.lyPick(this.lyList[Number(el.dataset.i)])));
+    } catch (e) { $('#lyResults').innerHTML = `<div class="small" style="color:var(--bad)">${esc(e.message)}</div>`; }
+  },
+  lyPick(x) {
+    H.lyrics = { id: String(x.id), title: x.title, artist: x.artist, synced: x.synced, lines: parseLRC(x.text, x.synced) };
+    H.ly = { a: null, s: 0, o: 0 };
+    $('#lyResults').innerHTML = '';
+    this.link?.broadcast({ t: 'lyrics', ly: H.lyrics });
+    this.changed();
+  },
+  lyAlign(i) { // 点一句 = “现在正唱到这句”
+    const line = H.lyrics?.lines[i];
+    if (!line || line.t === null) return;
+    const g = this.group();
+    if (g?.kind === 'live') H.ly = { a: Math.round(hostNow()), s: line.t, o: 0 };
+    else { const base = songPos(hostNow(), { pb: { status: H.playback.status, S: H.playback.startServerTime, o: H.playback.startOffset }, group: g }, { o: 0 }); H.ly.o = Math.round((line.t - base) * 10) / 10; }
+    toast('已对准：' + line.text.slice(0, 20));
+    this.changed();
+  },
+  renderLyrics() {
+    const L = H?.lyrics;
+    $('#lyNow').hidden = !L;
+    if (!L) { $('#lyView').innerHTML = ''; $('#lyView').__lines = null; renderLyricStrip($('#stageLyric'), null); return; }
+    const g = this.group();
+    const pos = songPos(hostNow(), { pb: { status: H.playback.status, S: H.playback.startServerTime, o: H.playback.startOffset }, group: g }, H.ly);
+    const idx = lineAt(L.lines, pos);
+    $('#lyTitle').textContent = `${L.title} — ${L.artist}`;
+    $('#lyOffset').textContent = H.ly.o ? `（偏移 ${H.ly.o > 0 ? '+' : ''}${H.ly.o}s）` : '';
+    const hint = !L.synced ? '这份歌词没有时间轴，只能整段显示' : g?.kind === 'live' && H.ly.a == null ? '👆 在右边歌词里点一下“正在唱的那一句”来对准' : '';
+    $('#lyHint').textContent = hint;
+    renderLyricLines($('#lyView'), L.lines, idx, (i) => this.lyAlign(i));
+    renderLyricStrip($('#stageLyric'), L.synced ? L.lines : null, idx, hint);
+  },
+
+  async openMic(micId) {
+    if (micId === 'self') {
+      const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
+      const recorder = new MicRecorder(ctx, hostNow);
+      await recorder.start();
+      return { recorder };
+    }
+    const client = [...this.link?.clients.values() || []].find((c) => c.did === micId);
+    if (!client) throw new Error('选的录音设备不在线');
+    this.link.send(client, { t: 'micPrep' });
+    const r = await this.waitFor(micId, 30000);
+    if (!r || r.t !== 'micReady') throw new Error(r?.msg ? '录音设备无法使用麦克风：' + r.msg : '录音设备没有回应（请在那台手机上允许麦克风）');
+    return { client };
+  },
+
+  // 分工检查：各设备轮流单独出声，麦克风录下来分析每台实际在放什么
+  async checkAssign() {
+    if (this.calibrating) return;
+    const out = (h) => ($('#checkOut').innerHTML = h);
+    const g = this.group();
+    const playing = g?.kind === 'live' ? this.live.running : H.playback.status === 'playing';
+    if (!playing) return toast('先开始播放音乐（或开始共享电脑声音），再做分工检查');
+    const micId = $('#calibMic').value;
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (!devs.length) return toast('还没有在线的播放设备');
+    this.calibrating = true; $('#checkBtn').disabled = true; $('#calibBtn').disabled = true;
+    let mic = null;
+    try {
+      out('🎙 打开麦克风中…');
+      mic = await this.openMic(micId);
+      const T0 = hostNow() + 1200, LEN = 2600, GAP = 300;
+      const noise = { from: T0 + 100, to: T0 + 800 };
+      const windows = devs.map((d, i) => ({ did: d.id, from: T0 + 1000 + i * (LEN + GAP), to: T0 + 1000 + i * (LEN + GAP) + LEN }));
+      const end = windows[windows.length - 1].to + 300;
+      for (const w of windows) {
+        if (w.did === 'self') this.selfEngine.solo(w.from, w.to, end);
+        else for (const c of this.link.clients.values()) if (c.did === w.did) this.link.send(c, { t: 'solo', from: w.from, to: w.to, end });
+      }
+      // 不在列表里的在线设备（理论上没有）也一起静音
+      out(`🔍 各设备轮流单独出声中，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
+      let res;
+      if (mic.recorder) {
+        await sleep(end - hostNow());
+        out('🧮 分析中…'); await sleep(30);
+        res = analyzeWindows(mic.recorder.stop(), windows, noise); mic.recorder = null;
+      } else {
+        this.link.send(mic.client, { t: 'measure', kind: 'spectrum', end, windows, noise });
+        const r = await this.waitFor(micId, end - hostNow() + 20000);
+        if (!r || r.t !== 'measureResult') throw new Error('录音设备没有返回结果');
+        res = r.results;
+      }
+      this.checkRes = Object.fromEntries(res.map((r) => [r.did, r]));
+      const plans = this.plans();
+      const bar = (v, color) => `<span style="display:inline-block;height:8px;width:${Math.round(v * 60)}px;background:${color};border-radius:2px"></span>`;
+      out(`<div class="small muted" style="margin:4px 0">每台设备单独出声时录到的声音：<span style="color:#ff922b">■</span> 低频 <span style="color:#51cf66">■</span> 中频 <span style="color:#4dabf7">■</span> 高频</div>
+        <table class="small" style="width:100%">${res.map((r) => {
+          const d = H.devices[r.did], pl = plans[r.did];
+          const planned = H.mode === 'split' ? pl?.assign.map((k) => assignLabel(H, k)).join(' + ') : '完整混音';
+          return `<tr><td>${esc(d?.name || r.did)}<div class="muted">应放：${esc(planned || '—')}</div></td>
+            <td>${bar(r.share.low, '#ff922b')}${bar(r.share.mid, '#51cf66')}${bar(r.share.high, '#4dabf7')}</td>
+            <td><b>${esc(r.label)}</b><div class="muted">${r.snr.toFixed(0)} dB</div></td></tr>`;
+        }).join('')}</table>`);
+      this.changed();
+    } catch (e) {
+      out('❌ ' + esc(e.message || String(e)));
+    } finally {
+      if (mic?.recorder) try { mic.recorder.stop(); } catch {}
+      this.calibrating = false; $('#checkBtn').disabled = false; $('#calibBtn').disabled = false;
+    }
+  },
+
   async calibrate() {
     if (this.calibrating) return;
     const out = (h) => ($('#calibOut').innerHTML = h);
@@ -636,12 +831,13 @@ const host = {
     $('#opusOn').checked = H.opus;
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
+    $('#liveStems').checked = !!H.liveStems;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
-    const opusN = clients.filter((c) => c.opus && this.live.wantOpus).length;
+    const opusN = clients.filter((c) => c.opus && H.opus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
-      ? `共享类型：${surf}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
+      ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
       : '未在共享';
   },
 
@@ -688,6 +884,7 @@ const host = {
         } else if (H.options.stereo) parts.push(plan.pan < -0.2 ? '偏左' : plan.pan > 0.2 ? '偏右' : '居中');
         if (d.override?.locked) parts.push('🔒');
         sub = parts.join(' · ');
+        if (this.checkRes?.[d.id]) sub += `  🎙${this.checkRes[d.id].label}`;
       }
       g.append(el('text', { 'text-anchor': 'middle', y: r + 40, class: 'sub' }, sub));
       svg.append(g);
@@ -891,12 +1088,13 @@ function arcSpot(n) {
   };
 }
 
+const decodeLy = (cur) => cur.ly || null;
 function decodeWire(w, did) {
   if (!w || w.v !== 1) return null;
   const g = w.g && { id: w.g.id, kind: w.g.k, name: w.g.n, loop: !!w.g.l, duration: w.g.d, tracks: w.g.t.map(([src, ch]) => ({ src, channels: ch })) };
   const pb = { status: PB_NAME[w.pb[0]], S: w.pb[1], o: w.pb[2] };
   const p = w.p[did];
-  const base = { group: g, pb, mode: w.m, ld: w.ld };
+  const base = { group: g, pb, mode: w.m, ld: w.ld, ly: w.ly };
   if (!p || !g) return { ...base, plan: null };
   const [gain, posDelay, latency, srcs, label, color, name] = p;
   return {
@@ -946,7 +1144,7 @@ const node = {
     try { await this.engine.unlock(); } catch { this.engine.error = '无法启用声音，请再点一次页面'; }
     $('#overlay').remove();
     this.engine.addEventListener('status', () => this.render());
-    this.decoder = new LiveDecoder(this.engine.ctx, (ts, buf) => this.engine.pushLive(ts, buf));
+    this.decoder = new LiveDecoder(this.engine.ctx, (ts, buf, src) => this.engine.pushLive(ts, buf, src));
     if (!window.Peer) { this.err = '连接库没加载出来，检查网络后刷新'; return this.render(); }
     const opus = await opusDecodeSupported();
     this.link = new NodeLink(code, () => ({ t: 'hello', did: this.did, name: this.name, type: detectDeviceType(), opus }));
@@ -961,6 +1159,7 @@ const node = {
     setInterval(() => this.burst(5), 10000);
     setInterval(() => this.sendStats(), 2000);
     setInterval(() => this.render(), 500);
+    setInterval(() => this.renderLyrics(), 150);
     document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && this.burst(8));
     this.render();
   },
@@ -980,6 +1179,8 @@ const node = {
     } else if (m.t === 'beep') {
       this.engine.beep();
       const el = $('#nodeMain'); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    } else if (m.t === 'lyrics') {
+      this.lyrics = m.ly;
     } else if (m.t === 'chirp' && Array.isArray(m.at)) {
       if (m.until) this.engine.duck(m.until);
       m.at.forEach((t) => this.engine.playChirpAt(t));
@@ -995,9 +1196,14 @@ const node = {
       (async () => {
         await sleep(Math.max(0, m.end - this.clock.now()));
         const rec = this.rec; this.rec = null;
-        const results = detectChirps(rec.stop(), m.slots).map((r) => ({ did: r.did, err: r.err, ok: r.ok }));
+        const data = rec.stop();
+        const results = m.kind === 'spectrum'
+          ? analyzeWindows(data, m.windows, m.noise)
+          : detectChirps(data, m.slots).map((r) => ({ did: r.did, err: r.err, ok: r.ok }));
         this.link.send({ t: 'measureResult', results });
       })();
+    } else if (m.t === 'solo') {
+      this.engine.solo(m.from, m.to, m.end);
     } else if (m.t === 'fileErr') {
       const f = this.files.get(m.id);
       if (f && !f.done) { f.reject(new Error('控制端找不到这个文件（控制端刷新后需要重新添加）')); this.files.delete(m.id); }
@@ -1006,7 +1212,8 @@ const node = {
 
   onBin({ hdr, payload }) {
     if (hdr.k === 'l') {
-      try { hdr.c === 'o' ? this.decoder.opus(hdr.ts, payload) : this.decoder.pcm(hdr.ts, payload, hdr.sr || 48000); } catch {}
+      const ch = hdr.ch || 2, src = hdr.s || 'live';
+      try { hdr.c === 'o' ? this.decoder.opus(hdr.ts, payload, ch, src) : this.decoder.pcm(hdr.ts, payload, hdr.sr || 48000, ch, src); } catch {}
     } else if (hdr.k === 'f') {
       const f = this.files.get(hdr.id);
       if (!f || f.done) return;
@@ -1070,6 +1277,14 @@ const node = {
   },
 
   setSelf(patch) { this.link?.send({ t: 'self', ...patch }); },
+
+  renderLyrics() {
+    const L = this.lyrics, ly = this.cur && decodeLy(this.cur);
+    if (!L || !ly || ly.id !== L.id) { $('#nodeLyric').hidden = true; return; }
+    const pos = songPos(this.clock.now(), this.cur, ly);
+    const idx = lineAt(L.lines, pos);
+    renderLyricStrip($('#nodeLyric'), L.synced ? L.lines : null, idx, this.cur.group?.kind === 'live' && ly.a == null ? '等控制端对准歌词…' : '');
+  },
 
   render() {
     const e = this.engine; if (!e) return;

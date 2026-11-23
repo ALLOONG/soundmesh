@@ -59,6 +59,7 @@
         <button class="small" id="arc">设备排成弧形</button>
       </div>
       <svg id="canvas"></svg>
+      <div id="stageLyric" class="ly-strip" hidden></div>
     </div>
 
     <aside>
@@ -92,6 +93,7 @@
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
           <div class="row"><span>缓冲延迟</span><input type="range" id="liveDelay" min="80" max="1500" step="10" class="grow" style="width:auto" /><b id="liveDelayVal"></b></div>
+          <label><input type="checkbox" id="liveStems" /> 🎚 实时拆声部（人声/鼓/贝斯/伴奏，配合“声音分工”按位置分给各设备）</label>
           <label><input type="checkbox" id="pcPlay" /> 电脑也出声（关掉 = 只有手机/平板出声，电脑静音）</label>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
           <label><input type="checkbox" id="opusOn" /> 压缩传输（Opus，省流量；不支持的设备自动用无损）</label>
@@ -108,12 +110,29 @@
       </section>
 
       <section class="card stack">
-        <h2>🎯 自动校准（让所有设备同时出声）</h2>
+        <h2>🎤 歌词</h2>
+        <div class="row"><input type="text" id="lyQ" class="grow" placeholder="歌名 + 歌手，比如：晴天 周杰伦" /><button id="lySearch">搜索</button></div>
+        <div id="lyResults" class="stack"></div>
+        <div id="lyNow" class="stack" hidden>
+          <div class="row small"><b id="lyTitle" class="grow"></b><span id="lyOffset" class="muted"></span></div>
+          <div class="row small"><button class="small" id="lyEarly">歌词提早 0.3s</button><button class="small" id="lyLate">歌词延后 0.3s</button><span class="grow"></span><button class="small danger" id="lyClear">清除</button></div>
+          <div id="lyHint" class="small" style="color:var(--warn)"></div>
+          <div id="lyView" class="ly-view"></div>
+          <div class="muted small">歌词来自 LRCLIB 免费歌词库。点任何一句 = “现在正唱到这句”，可以随时重新对准。手机上也会同步显示。</div>
+        </div>
+      </section>
+
+      <section class="card stack">
+        <h2>🎯 校准与检查（麦克风）</h2>
         <div class="small muted">每台设备会轮流发出“啾”声，由一个麦克风在<b>听众位</b>录下来，自动算出每台设备快了还是慢了多少，再填进它的“延迟微调”。蓝牙音箱、不同手机的扬声器延迟都能这样校准。</div>
         <div class="row small"><span>录音设备</span><select id="calibMic" class="grow"></select></div>
         <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
         <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="calibUndo" class="small" hidden>撤销</button></div>
         <div id="calibOut" class="small"></div>
+        <hr style="border:0;border-top:1px solid var(--line);width:100%">
+        <div class="small muted"><b>🔍 分工检查</b>：播放音乐时，各设备轮流单独出声约 2.6 秒，用同一个麦克风录下来，看每台<b>实际</b>放出来的是低音、人声中频、打击还是高频，确认分工有没有生效。</div>
+        <div class="row"><button id="checkBtn">开始分工检查</button></div>
+        <div id="checkOut" class="small"></div>
       </section>
 
       <section class="card stack">
@@ -173,6 +192,7 @@
       <div class="muted small" id="roomLine"></div>
       <div class="bigname" id="bigname">…</div>
       <div class="assign" id="assign">等待控制端</div>
+      <div id="nodeLyric" class="ly-strip" hidden></div>
       <div class="meter"><div id="vol"></div></div>
       <div class="small" id="pbLine" style="margin-bottom:14px"></div>
       <div class="panel stack" style="margin-top:12px">

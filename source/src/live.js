@@ -71,32 +71,16 @@ export class LiveCapture extends EventTarget {
     this.anchor = null; this.ema = 0; this.stats = { chunks: 0, level: 0 };
     this.node.port.onmessage = (e) => this.onChunk(e.data);
     stream.getAudioTracks()[0].addEventListener('ended', () => this.stop());
-    this.setupEncoder();
     this.running = true;
     this.emit('state', true);
   }
 
-  setupEncoder() {
-    this.encoder = null;
-    if (typeof AudioEncoder === 'undefined') return;
-    try {
-      this.encoder = new AudioEncoder({
-        output: (chunk) => {
-          const data = new Uint8Array(chunk.byteLength);
-          chunk.copyTo(data);
-          this.emit('opus', { ts: chunk.timestamp / 1000, data });
-        },
-        error: () => { this.encoder = null; },
-      });
-      this.encoder.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: 2, bitrate: 160000 });
-    } catch { this.encoder = null; }
-  }
-
   // 采集帧号 -> 控制端时钟（毫秒）。音频硬件时钟和系统时钟会慢慢漂移，偏差超过 15ms 就重新对准
+  tsOf(frame) { return this.anchor.host + ((frame - this.anchor.frame) / SR) * 1000; }
   onChunk({ frame, l, r }) {
     const now = this.hostNow();
     if (!this.anchor) this.anchor = { host: now - (FRAMES / SR) * 1000, frame };
-    const ts = this.anchor.host + ((frame - this.anchor.frame) / SR) * 1000;
+    const ts = this.tsOf(frame);
     const err = now - (ts + (FRAMES / SR) * 1000);
     this.ema = this.ema * 0.97 + err * 0.03;
     if (Math.abs(this.ema) > 15) { this.anchor.host += this.ema; this.ema = 0; }
@@ -104,69 +88,82 @@ export class LiveCapture extends EventTarget {
     for (let i = 0; i < FRAMES; i += 8) peak = Math.max(peak, Math.abs(l[i]), Math.abs(r[i]));
     this.stats.level = Math.max(peak, this.stats.level * 0.9);
     this.stats.chunks++;
-    this.emit('chunk', { ts, l, r }); // 原始 PCM（给不支持 Opus 的设备、以及控制端本机）
-    if (this.encoder && this.wantOpus && this.encoder.state === 'configured') {
-      const planar = new Float32Array(FRAMES * 2);
-      planar.set(l, 0); planar.set(r, FRAMES);
-      const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: FRAMES, numberOfChannels: 2, timestamp: Math.round(ts * 1000), data: planar });
-      this.encoder.encode(ad);
-      ad.close();
-    }
+    this.emit('chunk', { frame, ts, l, r });
   }
 
   async stop() {
     if (!this.running && !this.stream) return;
     this.running = false;
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
-    try { this.encoder?.close(); } catch {}
     try { await this.ctx?.close(); } catch {}
-    this.stream = null; this.ctx = null; this.encoder = null;
+    this.stream = null; this.ctx = null;
     this.emit('state', false);
   }
 }
 
-// PCM 打包：Float32 两声道 -> Int16 交错
-export function pcmEncode(l, r) {
-  const out = new Int16Array(l.length * 2);
-  for (let i = 0; i < l.length; i++) {
-    out[2 * i] = Math.max(-1, Math.min(1, l[i])) * 32767;
-    out[2 * i + 1] = Math.max(-1, Math.min(1, r[i])) * 32767;
-  }
+// PCM 打包：Float32 各声道 -> Int16 交错
+export function pcmEncode(planes) {
+  const ch = planes.length, n = planes[0].length, out = new Int16Array(n * ch);
+  for (let i = 0; i < n; i++) for (let c = 0; c < ch; c++) out[i * ch + c] = Math.max(-1, Math.min(1, planes[c][i])) * 32767;
   return out;
+}
+
+// 一路音频（完整混音或某个声部）的 Opus 编码器
+export class StreamEncoder {
+  constructor(channels, onChunk) {
+    this.channels = channels; this.ok = false;
+    if (typeof AudioEncoder === 'undefined') return;
+    try {
+      this.enc = new AudioEncoder({
+        output: (chunk) => { const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d); onChunk(chunk.timestamp / 1000, d); },
+        error: () => { this.ok = false; },
+      });
+      this.enc.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: channels, bitrate: channels === 2 ? 160000 : 96000 });
+      this.ok = true;
+    } catch { this.ok = false; }
+  }
+  encode(ts, planes) {
+    if (!this.ok || this.enc.state !== 'configured') return false;
+    const n = planes[0].length, data = new Float32Array(n * this.channels);
+    planes.forEach((p, c) => data.set(p, c * n));
+    const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: n, numberOfChannels: this.channels, timestamp: Math.round(ts * 1000), data });
+    this.enc.encode(ad); ad.close();
+    return true;
+  }
+  close() { try { this.enc?.close(); } catch {} }
 }
 
 // 播放节点：把收到的分段变成 AudioBuffer
 export class LiveDecoder {
   constructor(ctx, onBuffer) {
-    this.ctx = ctx; this.onBuffer = onBuffer; this.dec = null;
+    this.ctx = ctx; this.onBuffer = onBuffer; this.decs = new Map();
   }
-  pcm(ts, payload, sr) {
+  pcm(ts, payload, sr, ch, src) {
     const pcm = new Int16Array(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
-    const n = pcm.length / 2;
-    const buf = this.ctx.createBuffer(2, n, sr);
-    const L = buf.getChannelData(0), R = buf.getChannelData(1);
-    for (let i = 0; i < n; i++) { L[i] = pcm[2 * i] / 32768; R[i] = pcm[2 * i + 1] / 32768; }
-    this.onBuffer(ts, buf);
+    const n = pcm.length / ch, buf = this.ctx.createBuffer(ch, n, sr);
+    for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) d[i] = pcm[i * ch + c] / 32768; }
+    this.onBuffer(ts, buf, src);
   }
-  opus(ts, payload) {
-    if (!this.dec || this.dec.state === 'closed') {
-      this.dec = new AudioDecoder({
+  opus(ts, payload, ch, src) {
+    let dec = this.decs.get(src);
+    if (!dec || dec.state === 'closed') {
+      dec = new AudioDecoder({
         output: (ad) => {
-          const n = ad.numberOfFrames, ch = Math.min(2, ad.numberOfChannels);
-          const buf = this.ctx.createBuffer(2, n, ad.sampleRate);
-          for (let c = 0; c < 2; c++) {
+          const n = ad.numberOfFrames, buf = this.ctx.createBuffer(ch, n, ad.sampleRate);
+          for (let c = 0; c < ch; c++) {
             const tmp = new Float32Array(n);
-            ad.copyTo(tmp, { planeIndex: Math.min(c, ch - 1), format: 'f32-planar' });
+            ad.copyTo(tmp, { planeIndex: Math.min(c, ad.numberOfChannels - 1), format: 'f32-planar' });
             buf.copyToChannel(tmp, c);
           }
           const t = ad.timestamp / 1000;
           ad.close();
-          this.onBuffer(t, buf);
+          this.onBuffer(t, buf, src);
         },
-        error: () => { this.dec = null; },
+        error: () => this.decs.delete(src),
       });
-      this.dec.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: 2 });
+      dec.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: ch });
+      this.decs.set(src, dec);
     }
-    this.dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1000), data: payload }));
+    dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(ts * 1000), data: payload }));
   }
 }

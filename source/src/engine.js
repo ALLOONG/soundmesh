@@ -10,7 +10,7 @@ export class Engine extends EventTarget {
     super();
     this.clock = clock; // { now(): 控制端时钟毫秒, synced: bool }
     this.fetchFile = fetchFile; // (id) => Promise<ArrayBuffer>，从控制端拉取文件
-    this.liveIn = null; this.liveVoices = []; this.liveSig = null; this.liveCursor = null;
+    this.liveIns = new Map(); this.liveVoices = []; this.liveSig = null; this.liveCursor = new Map();
     this.liveStats = { got: 0, late: 0, resyncs: 0, err: null };
     this.liveSources = new Set();
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -68,6 +68,17 @@ export class Engine extends EventTarget {
     const g = this.deviceGain.gain;
     g.cancelScheduledValues(t); g.setTargetAtTime(0, t, 0.03);
     g.setTargetAtTime(this.cur?.plan?.gain ?? 1, end, 0.1);
+  }
+
+  // 分工检查：只在 [from, to) 这段时间出声，其余时间（到 end 为止）静音
+  solo(from, to, end) {
+    const t = this.ctx.currentTime, g = this.deviceGain.gain, plan = this.cur?.plan?.gain ?? 1;
+    const c = (ms) => Math.max(t, this.clockToCtx(ms));
+    this.duckUntil = c(end);
+    g.cancelScheduledValues(t); g.setTargetAtTime(0, t, 0.03);
+    g.setTargetAtTime(plan, c(from), 0.05);
+    g.setTargetAtTime(0, c(to), 0.05);
+    g.setTargetAtTime(plan, c(end), 0.1);
   }
 
   // 校准用：在控制端时间 at（再加本机当前的总延迟，和放音乐时一样）播放一声“啾”
@@ -255,48 +266,57 @@ export class Engine extends EventTarget {
 
   // ---------- 实时音源 ----------
   ensureLiveGraph(plan) {
-    const sig = JSON.stringify(plan.sources.map((s) => [s.mix.type, s.mix.index, s.filters.map((f) => f.type)]));
-    if (sig === this.liveSig && this.liveIn) return;
+    const sig = JSON.stringify(plan.sources.map((s) => [s.src, s.mix.type, s.mix.index, s.filters.map((f) => f.type)]));
+    if (sig === this.liveSig && this.liveIns.size) return;
     this.teardownLive();
     this.liveSig = sig;
-    this.liveIn = this.ctx.createGain();
-    this.liveIn.channelCount = 2; this.liveIn.channelCountMode = 'explicit';
-    this.liveVoices = plan.sources.map((s, idx) => Object.assign(this.buildChain(this.liveIn, 2, s), { idx }));
+    this.liveVoices = plan.sources.map((s, idx) => {
+      const ch = s.src === 'live' ? 2 : 1;
+      let input = this.liveIns.get(s.src);
+      if (!input) {
+        input = this.ctx.createGain();
+        input.channelCount = ch; input.channelCountMode = 'explicit';
+        this.liveIns.set(s.src, input);
+      }
+      return Object.assign(this.buildChain(input, ch, s), { idx });
+    });
   }
   teardownLive() {
-    if (!this.liveIn) return;
+    if (!this.liveIns.size && !this.liveVoices.length) return;
     for (const src of this.liveSources) { try { src.stop(); } catch {} }
     this.liveSources.clear();
-    try { this.liveIn.disconnect(); } catch {}
+    for (const n of this.liveIns.values()) try { n.disconnect(); } catch {}
     for (const v of this.liveVoices) { try { v.out.disconnect(); } catch {} v.nodes.forEach((n) => { try { n.disconnect(); } catch {} }); }
-    this.liveIn = null; this.liveVoices = []; this.liveSig = null; this.liveCursor = null;
+    this.liveIns = new Map(); this.liveVoices = []; this.liveSig = null; this.liveCursor = new Map();
   }
   // 收到一段实时音频：在“采集时刻 + 统一缓冲延迟 + 本机延迟”播出
-  pushLive(ts, buffer) {
+  pushLive(ts, buffer, srcName = 'live') {
     const cur = this.cur;
-    if (!this.unlocked || !this.clock.synced || !cur?.plan || cur.group?.kind !== 'live' || !this.liveIn) return;
+    const input = this.liveIns.get(srcName);
+    if (!this.unlocked || !this.clock.synced || !cur?.plan || cur.group?.kind !== 'live' || !input) return;
     this.liveStats.got++;
     const expected = this.clockToCtx(ts + (cur.ld || 350) + cur.plan.D);
     const now = this.ctx.currentTime;
     if (expected + buffer.duration < now + 0.005) { this.liveStats.late++; return; } // 来得太晚，丢掉
     let when, rate = 1;
-    if (this.liveCursor === null || Math.abs(this.liveCursor - expected) > 0.04) {
+    const cursor = this.liveCursor.get(srcName) ?? null;
+    if (cursor === null || Math.abs(cursor - expected) > 0.04) {
       when = Math.max(expected, now + 0.005);
       this.liveStats.resyncs++;
     } else {
       // 紧接上一段播放（无缝），并用极小的变速慢慢追平时钟误差（最多 0.3%，听不出来）
-      when = this.liveCursor;
-      const err = this.liveCursor - expected;
+      when = cursor;
+      const err = cursor - expected;
       rate = 1 + Math.max(-0.003, Math.min(0.003, err * 2));
     }
     const src = this.ctx.createBufferSource();
     src.buffer = buffer;
     src.playbackRate.value = rate;
-    src.connect(this.liveIn);
+    src.connect(input);
     src.start(when);
     src.onended = () => { this.liveSources.delete(src); try { src.disconnect(); } catch {} };
     this.liveSources.add(src);
-    this.liveCursor = when + buffer.duration / rate;
+    this.liveCursor.set(srcName, when + buffer.duration / rate);
     this.liveStats.err = (when - expected) * 1000;
   }
 

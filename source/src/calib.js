@@ -1,3 +1,4 @@
+import { FFT } from './separator.js';
 // 麦克风自动校准：每台设备在指定时刻播放一段扫频“啾”声，听众位的麦克风录下来，
 // 用互相关找出每台设备实际出声的时间，算出各自的固定延迟差。
 
@@ -95,3 +96,48 @@ export function detectChirps({ rec, sr, startHost }, slots) {
 }
 
 export const median = (arr) => { const a = [...arr].sort((x, y) => x - y); return a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : null; };
+
+// ---------- 分工检查：分析每台设备单独出声时的频谱 ----------
+// windows: [{ did, from, to }]（控制端时间），noiseWin: { from, to }（所有设备静音时的底噪）
+export function analyzeWindows({ rec, sr, startHost }, windows, noiseWin) {
+  const N = 2048, fft = new FFT(N), hann = new Float64Array(N);
+  for (let i = 0; i < N; i++) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N);
+  const binHz = sr / N;
+  const toIdx = (t) => Math.round(((t - startHost) / 1000) * sr);
+  const feats = (from, to) => {
+    const a = Math.max(0, toIdx(from)), b = Math.min(rec.length, toIdx(to));
+    let low = 0, mid = 0, high = 0; const fe = [];
+    const re = new Float64Array(N), im = new Float64Array(N);
+    for (let s = a; s + N <= b; s += N / 2) {
+      for (let i = 0; i < N; i++) { re[i] = rec[s + i] * hann[i]; im[i] = 0; }
+      fft.run(re, im, false);
+      let e = 0;
+      for (let k = 1; k < N / 2; k++) {
+        const f = k * binHz, p = re[k] * re[k] + im[k] * im[k];
+        if (f < 200) low += p; else if (f < 2500) mid += p; else if (f < 10000) high += p;
+        if (f < 10000) e += p;
+      }
+      fe.push(e);
+    }
+    const mean = fe.reduce((x, y) => x + y, 0) / (fe.length || 1);
+    const sd = Math.sqrt(fe.reduce((x, y) => x + (y - mean) ** 2, 0) / (fe.length || 1));
+    return { low, mid, high, total: low + mid + high, cv: mean ? sd / mean : 0 };
+  };
+  const noise = feats(noiseWin.from, noiseWin.to);
+  return windows.map((w) => {
+    const f = feats(w.from + 400, w.to - 150); // 去掉开头淡入和结尾
+    // 减去底噪再算占比
+    const clean = { low: Math.max(0, f.low - noise.low), mid: Math.max(0, f.mid - noise.mid), high: Math.max(0, f.high - noise.high) };
+    const tot = clean.low + clean.mid + clean.high;
+    const snr = 10 * Math.log10((f.total + 1e-12) / (noise.total + 1e-12));
+    const share = tot > 0 ? { low: clean.low / tot, mid: clean.mid / tot, high: clean.high / tot } : { low: 0, mid: 0, high: 0 };
+    let label;
+    if (snr < 4) label = '几乎听不到';
+    else if (f.cv > 0.9) label = '打击（鼓）为主'; // 能量一下一下忽大忽小
+    else if (share.low > 0.55) label = '低音为主';
+    else if (share.mid > 0.6) label = '人声/旋律（中频）为主';
+    else if (share.high > 0.45) label = '高频为主';
+    else label = '全频混合';
+    return { did: w.did, snr, share, cv: f.cv, label };
+  });
+}

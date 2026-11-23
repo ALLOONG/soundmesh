@@ -1,7 +1,7 @@
 import re, pathlib
 src = pathlib.Path('src')  # 在 source 文件夹里运行
 js = []
-for f in ['mix.js', 'synth.js', 'calib.js', 'engine.js', 'transport.js', 'live.js', 'app.js']:
+for f in ['mix.js', 'synth.js', 'calib.js', 'separator.js', 'lyrics.js', 'engine.js', 'transport.js', 'live.js', 'app.js']:
     t = (src / f).read_text()
     t = re.sub(r'^import .*?;\s*$', '', t, flags=re.M)
     t = re.sub(r'^export \{[^}]*\};\s*$', '', t, flags=re.M)

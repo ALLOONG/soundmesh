@@ -76,12 +76,16 @@ function guessRole(name = '') {
 }
 export { guessRole };
 
+// 'mix' 轨道 = 完整混音（实时音源拆声部时同时提供完整混音和各声部）
+const stemTracks = (g) => g.tracks.filter((t) => t.role !== 'mix');
+const mixTracks = (g) => (g.tracks.some((t) => t.role === 'mix') ? g.tracks.filter((t) => t.role === 'mix') : g.tracks);
+
 // ---------- 自动分配（声音分工） ----------
 
 function autoAssignStems(devs, group, geo) {
   const out = new Map(devs.map((d) => [d.id, []]));
   if (!devs.length) return out;
-  const tracks = group.tracks;
+  const tracks = stemTracks(group);
   const free = new Set(devs.map((d) => d.id));
   const take = (id, key) => { out.get(id).push(key); free.delete(id); };
   const byFront = [...devs].sort((a, b) => Math.abs(geo[a.id].az) - Math.abs(geo[b.id].az));
@@ -168,7 +172,7 @@ export function assignOptions(room) {
   const group = room.library.find((g) => g.id === room.currentGroupId);
   if (!group) return [];
   const split = splitKind(room, group);
-  if (split === 'stems') return group.tracks.map((t) => ({ key: `track:${t.id}`, label: t.name }));
+  if (split === 'stems') return stemTracks(group).map((t) => ({ key: `track:${t.id}`, label: t.name }));
   if (split === 'channels') return channelLayout(group.tracks[0]?.channels || 2).map((c, i) => ({ key: `ch:${i}`, label: `声道 ${c.name}` }));
   return Object.entries(BAND_LABELS).map(([k, v]) => ({ key: `band:${k}`, label: v }));
 }
@@ -178,9 +182,9 @@ export function splitKind(room, group) {
   if (!group) return 'bands';
   const pref = room.splitPreset || 'auto';
   if (pref === 'bands') return 'bands';
-  if (pref === 'stems' && group.tracks.length > 1) return 'stems';
+  if (pref === 'stems' && stemTracks(group).length > 1) return 'stems';
   if (pref === 'channels' && (group.tracks[0]?.channels || 0) > 2) return 'channels';
-  if (group.tracks.length > 1) return 'stems';
+  if (stemTracks(group).length > 1) return 'stems';
   if ((group.tracks[0]?.channels || 0) > 2) return 'channels';
   return 'bands';
 }
@@ -241,7 +245,7 @@ export function computeMix(room) {
     if (group) {
       if (room.mode !== 'split') {
         // 协同播放：所有轨道一起出
-        sources = group.tracks.map((t) => ({ trackId: t.id, mix: stereoMix, filters: [] }));
+        sources = mixTracks(group).map((t) => ({ trackId: t.id, mix: stereoMix, filters: [] }));
         assign = ['all'];
       } else {
         assign = manual[d.id]?.length ? manual[d.id] : autoAssign.get(d.id) || [];
@@ -253,7 +257,7 @@ export function computeMix(room) {
             const t = group.tracks[0];
             if (t) sources.push({ trackId: t.id, mix: { type: 'ch', index: Number(val) }, filters: [] });
           } else if (kind === 'band') {
-            for (const t of group.tracks) sources.push({ trackId: t.id, mix: stereoMix, filters: bandFilters(val, room) });
+            for (const t of mixTracks(group)) sources.push({ trackId: t.id, mix: stereoMix, filters: bandFilters(val, room) });
           }
         }
       }
