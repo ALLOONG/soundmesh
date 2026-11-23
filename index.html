@@ -255,6 +255,8 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         </div>
         <div id="livePanel" class="stack small" hidden>
           <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
+          <button id="diagBtn" class="small">🩺 复制诊断记录（最近 2 分钟）</button>
+          <textarea id="diagOut" hidden readonly style="width:100%;height:90px;font-size:10px;background:var(--bg);color:var(--muted);border:1px solid var(--line);border-radius:6px"></textarea>
           <button id="mirrorBtn" style="width:100%">📺 同步画面（看视频时用：画面延后到和手机声音对齐）</button>
           <div class="meter" style="width:100%;margin:0;background:#0006"><div id="liveLevel" style="background:var(--ok)"></div></div>
           <div id="liveStatus" class="muted">未在共享</div>
@@ -4672,6 +4674,7 @@ function startHost(code, resume) {
 const host = {
   link: null, selfEngine: null, lastWire: '', pubTimer: null, selected: null, files: new Map(), sending: new Set(),
   live: new LiveCapture(hostNow), sep: null, encoders: new Map(), need: {},
+  dg: { chunks: 0, maxGap: 0, lastChunkAt: 0, sent: 0, log: [] },
 
   init(code, resume) {
     this.setCode(code);
@@ -4696,6 +4699,28 @@ const host = {
     this.live.addEventListener('state', (e) => this.onLiveState(e.detail));
     setInterval(() => this.tick(), 500);
     window.smHost = this; // 调试用
+    // 诊断记录：每秒一条，保留 2 分钟
+    setInterval(() => {
+      const dg = this.dg, clients = [...this.link?.clients.values() || []].filter((c) => c.did);
+      dg.log.push({
+        t: new Date().toTimeString().slice(0, 8), vis: document.visibilityState[0], foc: document.hasFocus() ? 1 : 0,
+        cap: this.live.running ? 1 : 0, chunks: dg.chunks, gap: Math.round(dg.maxGap), sent: dg.sent,
+        lag: this.lagShown === undefined ? null : Math.round(this.lagShown), ld: H.liveDelay, ctx: this.live.ctx?.state?.[0] || '-',
+        buf: clients.map((c) => Math.round(this.link.buffered(c) / 1024)),
+        dev: Object.values(H.devices).filter((d) => d.online && d.id !== 'self').map((d) => {
+          const s = d.stats || {};
+          return [d.name.slice(0, 8), s.live?.got ?? null, s.live?.late ?? null, s.live?.res ?? s.drifts ?? null, s.rtt ?? null, s.jitter ?? null, s.out ?? null, s.hidden ? 1 : 0, s.via === 'backup' ? 'B' : 'P'];
+        }),
+      });
+      dg.chunks = 0; dg.maxGap = 0; dg.sent = 0;
+      if (dg.log.length > 120) dg.log.shift();
+    }, 1000);
+    $('#diagBtn').onclick = () => {
+      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} UA=${navigator.userAgent}\n列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 处理延迟 缓冲ms 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道]\n`;
+      const txt = head + this.dg.log.map((r) => [r.t, r.vis, r.foc, r.cap, r.chunks, r.gap, r.sent, r.lag, r.ld, r.ctx, JSON.stringify(r.buf), JSON.stringify(r.dev)].join(' ')).join('\n');
+      $('#diagOut').hidden = false; $('#diagOut').value = txt;
+      navigator.clipboard?.writeText(txt).then(() => toast('诊断记录已复制，直接粘贴给 Claude 就行'), () => toast('自动复制失败：请在下面的框里全选后复制'));
+    };
     // 控制端被最小化/切到别的软件时：先把缓冲加大到至少 1500ms（画面用“同步画面”跟着延后），回到前台再恢复
     document.addEventListener('visibilitychange', () => {
       if (!H.autoDelay) return;
@@ -4822,6 +4847,9 @@ const host = {
   needs(did, src) { return !!this.need[did]?.has(src); },
   anyNeeds(src) { return Object.values(this.need).some((set) => set.has(src)); },
   onLiveChunk({ frame, ts, l, r }) {
+    const pn = performance.now();
+    if (this.dg.lastChunkAt) this.dg.maxGap = Math.max(this.dg.maxGap, pn - this.dg.lastChunkAt);
+    this.dg.lastChunkAt = pn; this.dg.chunks++;
     if (H.currentGroupId !== 'live') return;
     // 电脑自己处理慢了多少：这段声音采集完到现在过了多久（玩游戏/最小化时 CPU 被抢走会变大）
     const lag = hostNow() - (ts + 20);
@@ -4859,7 +4887,7 @@ const host = {
       if (H.opus && c.opus && this.encoderFor(src, planes.length).ok) { wantOpus = true; continue; }
       if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; } // 网络跟不上：丢这一段
       pcm = pcm || pcmEncode(planes);
-      this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: planes.length, s: src }, pcm));
+      if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: planes.length, s: src }, pcm))) this.dg.sent++;
     }
     if (wantOpus) this.encoderFor(src, planes.length).encode(ts, planes);
   },
@@ -4870,7 +4898,7 @@ const host = {
         for (const c of this.link?.clients.values() || []) {
           if (!c.did || !c.opus || !H.opus || !this.needs(c.did, src)) continue;
           if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
-          this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: src }, data));
+          if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: src }, data))) this.dg.sent++;
         }
       });
       this.encoders.set(src, e);
@@ -5908,7 +5936,7 @@ const node = {
         unlocked: e.unlocked && e.ctx.state === 'running', synced: this.clock.synced,
         hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via, bg: !!e.bgMode,
         ready: li.loaded === li.needed, loading: li.loaded < li.needed, dl: this.dlPercent(),
-        live: isLive ? { got: e.liveStats.got, late: e.liveStats.late } : null,
+        live: isLive ? { got: e.liveStats.got, late: e.liveStats.late, res: e.liveStats.resyncs } : null, drifts: e.resyncs,
         error: e.error ? String(e.error).slice(0, 100) : null,
       },
     });
