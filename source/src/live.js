@@ -42,7 +42,7 @@ export class LiveCapture extends EventTarget {
   async startCapture() {
     if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('这个浏览器不支持共享声音，请在电脑上用 Chrome 或 Edge');
     const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
+      video: { frameRate: { ideal: 30, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: true, restrictOwnAudio: true },
       systemAudio: 'include', selfBrowserSurface: 'exclude', surfaceSwitching: 'include',
     });
@@ -60,7 +60,98 @@ export class LiveCapture extends EventTarget {
     await this.stop();
     this.stream = stream;
     this.videoTrack = stream.getVideoTracks()[0] || null; // 画面留着给“同步画面”用
-    this.ctx = new AudioContext({ sampleRate: SR });
+    this.setVideoActive(false); // 平时不用画面：降到每秒 1 帧，减少电脑负担（避免 YouTube 卡顿）
+    const track = stream.getAudioTracks()[0];
+    this.anchor = null; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
+    this.running = true;
+    track.addEventListener('ended', () => this.stop());
+    // 首选：直接按顺序读采集流（电脑忙的时候声音会排队等着，不会丢）
+    const forceWorklet = new URLSearchParams(location.search).get('cap') === 'worklet';
+    if (!forceWorklet && typeof window.MediaStreamTrackProcessor === 'function' && (await this.startReader(track))) this.mode = 'stream';
+    else { await this.startWorklet(stream); this.mode = 'worklet'; }
+    this.emit('state', true);
+  }
+
+  setVideoActive(on) {
+    const t = this.videoTrack;
+    if (!t) return;
+    t.enabled = on;
+    t.applyConstraints(on ? { frameRate: { ideal: 30, max: 30 }, width: { max: 1280 }, height: { max: 720 } } : { frameRate: { max: 1 } }).catch(() => {});
+  }
+
+  // 方式一：MediaStreamTrackProcessor。音频数据由浏览器排队交给页面，带原始时间戳；
+  // 最多缓存约 4 秒，页面一时忙不过来也不会丢声音
+  async startReader(track) {
+    const reader = (this.reader = new MediaStreamTrackProcessor({ track, maxBufferSize: 400 }).readable.getReader());
+    // 先读第一包确认采样率（不是 48kHz 就改用方式二，由 AudioContext 负责重采样）
+    let first;
+    try { first = await reader.read(); } catch { return false; }
+    if (first.done) return false;
+    this.pend = [new Float32Array(FRAMES), new Float32Array(FRAMES)]; this.pi = 0; this.t0 = null; this.next = null; this.chunkFrame = 0;
+    this.rs = { pos: 1, l: 0, r: 0 }; // 采样率转换的状态（不是 48kHz 时用）
+    this.onAudioData(first.value);
+    (async () => {
+      while (this.running && this.reader === reader) {
+        let r;
+        try { r = await reader.read(); } catch { break; }
+        if (r.done) break;
+        this.onAudioData(r.value);
+      }
+    })();
+    return true;
+  }
+  onAudioData(ad) {
+    try {
+      const ch = ad.numberOfChannels;
+      let L = new Float32Array(ad.numberOfFrames), R = new Float32Array(ad.numberOfFrames);
+      ad.copyTo(L, { planeIndex: 0, format: 'f32-planar' });
+      ad.copyTo(R, { planeIndex: ch > 1 ? 1 : 0, format: 'f32-planar' });
+      if (ad.sampleRate !== SR) [L, R] = this.resample(L, R, ad.sampleRate);
+      const n = L.length;
+      // 按实际收到的采样数连续排列（浏览器给的时间戳有 1~2ms 的抖动，不能直接用来定位）；
+      // 只有时间戳显示中间真的断了超过 0.2 秒，才补上相应长度的静音
+      if (this.t0 === null) { this.t0 = ad.timestamp; this.cum = 0; }
+      const expectUs = this.t0 + (this.cum / SR) * 1e6;
+      const gapUs = ad.timestamp - expectUs;
+      if (gapUs > 200000) {
+        const gap = Math.min(SR * 5, Math.round((gapUs / 1e6) * SR));
+        this.push(new Float32Array(gap), new Float32Array(gap));
+        this.cum += gap;
+      }
+      this.push(L, R);
+      this.cum += n;
+    } finally { ad.close(); }
+  }
+  // 线性插值转成 48kHz（跨包保持连续）
+  resample(L, R, rate) {
+    const ratio = rate / SR, st = this.rs, n = L.length;
+    const at = (arr, prev, i) => (i === 0 ? prev : arr[i - 1]); // 下标 0 = 上一包最后一个样本
+    const outL = [], outR = [];
+    let p = st.pos;
+    while (p < n) {
+      const i = Math.floor(p), fr = p - i;
+      const l0 = at(L, st.l, i), l1 = at(L, st.l, i + 1), r0 = at(R, st.r, i), r1 = at(R, st.r, i + 1);
+      outL.push(l0 + (l1 - l0) * fr); outR.push(r0 + (r1 - r0) * fr);
+      p += ratio;
+    }
+    st.pos = p - n; st.l = L[n - 1]; st.r = R[n - 1];
+    return [Float32Array.from(outL), Float32Array.from(outR)];
+  }
+
+  push(L, R) {
+    for (let i = 0; i < L.length; i++) {
+      this.pend[0][this.pi] = L[i]; this.pend[1][this.pi] = R[i];
+      if (++this.pi === FRAMES) {
+        this.onChunk({ frame: this.chunkFrame, l: this.pend[0], r: this.pend[1] });
+        this.chunkFrame += FRAMES;
+        this.pend = [new Float32Array(FRAMES), new Float32Array(FRAMES)]; this.pi = 0;
+      }
+    }
+  }
+
+  // 方式二（备用）：AudioWorklet。用较大的音频缓冲（latencyHint: playback），减少电脑忙时丢声音
+  async startWorklet(stream) {
+    this.ctx = new AudioContext({ sampleRate: SR, latencyHint: 'playback' });
     await this.ctx.resume();
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
     await this.ctx.audioWorklet.addModule(url);
@@ -69,22 +160,23 @@ export class LiveCapture extends EventTarget {
     this.node = new AudioWorkletNode(this.ctx, 'sm-cap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit' });
     const mute = this.ctx.createGain(); mute.gain.value = 0;
     this.srcNode.connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
-    this.anchor = null; this.ema = 0; this.stats = { chunks: 0, level: 0 };
     this.node.port.onmessage = (e) => this.onChunk(e.data);
-    stream.getAudioTracks()[0].addEventListener('ended', () => this.stop());
-    this.running = true;
-    this.emit('state', true);
   }
 
-  // 采集帧号 -> 控制端时钟（毫秒）。音频硬件时钟和系统时钟会慢慢漂移，偏差超过 15ms 就重新对准
+  // 采集帧号 -> 控制端时钟（毫秒）
   tsOf(frame) { return this.anchor.host + ((frame - this.anchor.frame) / SR) * 1000; }
   onChunk({ frame, l, r }) {
     const now = this.hostNow();
     if (!this.anchor) this.anchor = { host: now - (FRAMES / SR) * 1000, frame };
     const ts = this.tsOf(frame);
+    // 长期漂移校正：只看 3 秒内“处理得最及时”的那一段。电脑忙导致的处理延迟只会让数值变大，
+    // 取最小值就能把它排除掉，不会因为电脑一时卡顿就把时间戳调偏（那样会让设备反复重新对齐）
     const err = now - (ts + (FRAMES / SR) * 1000);
-    this.ema = this.ema * 0.97 + err * 0.03;
-    if (Math.abs(this.ema) > 15) { this.anchor.host += this.ema; this.ema = 0; }
+    this.minErr = Math.min(this.minErr, err);
+    if (++this.errN >= 150) {
+      if (Math.abs(this.minErr) > 10) this.anchor.host += this.minErr;
+      this.minErr = Infinity; this.errN = 0;
+    }
     let peak = 0;
     for (let i = 0; i < FRAMES; i += 8) peak = Math.max(peak, Math.abs(l[i]), Math.abs(r[i]));
     this.stats.level = Math.max(peak, this.stats.level * 0.9);
@@ -95,6 +187,8 @@ export class LiveCapture extends EventTarget {
   async stop() {
     if (!this.running && !this.stream) return;
     this.running = false;
+    try { this.reader?.cancel(); } catch {}
+    this.reader = null;
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
     try { await this.ctx?.close(); } catch {}
     this.stream = null; this.ctx = null; this.videoTrack = null;

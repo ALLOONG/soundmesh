@@ -246,18 +246,18 @@ const host = {
       if (dg.log.length > 120) dg.log.shift();
     }, 1000);
     $('#diagBtn').onclick = () => {
-      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} UA=${navigator.userAgent}\n列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 静音片段数 音量峰值 处理延迟 缓冲ms 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道]\n`;
+      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} 采集方式=${this.live.mode || '-'} UA=${navigator.userAgent}\n列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 静音片段数 音量峰值 处理延迟 缓冲ms 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道]\n`;
       const txt = head + this.dg.log.map((r) => [r.t, r.vis, r.foc, r.cap, r.chunks, r.gap, r.sent, `静音${r.sil}`, `峰值${r.pk}`, r.lag, r.ld, r.ctx, JSON.stringify(r.buf), JSON.stringify(r.dev)].join(' ')).join('\n');
       $('#diagOut').hidden = false; $('#diagOut').value = txt;
       navigator.clipboard?.writeText(txt).then(() => toast('诊断记录已复制，直接粘贴给 Claude 就行'), () => toast('自动复制失败：请在下面的框里全选后复制'));
     };
-    // 控制端被最小化/切到别的软件时：先把缓冲加大到至少 1500ms（画面用“同步画面”跟着延后），回到前台再恢复
+    // 控制端被最小化/切到别的软件时：先把缓冲加大到至少 800ms（画面用“同步画面”跟着延后），回到前台再恢复
     document.addEventListener('visibilitychange', () => {
       if (!H.autoDelay) return;
-      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 1500) {
-        this.boostFrom = H.liveDelay; H.liveDelay = 1500; this.lastBump = Date.now(); this.changed();
+      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 800) {
+        this.boostFrom = H.liveDelay; H.liveDelay = 800; this.lastBump = Date.now(); this.changed();
       } else if (document.visibilityState === 'visible' && this.boostFrom) {
-        if (H.liveDelay === 1500) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
+        if (H.liveDelay === 800) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
         this.boostFrom = null; this.changed();
       }
     });
@@ -461,10 +461,15 @@ const host = {
       if (!VideoMirror.supported()) return toast('这个浏览器不支持同步画面，请用电脑版 Chrome 或 Edge');
       if (!this.live.running || !this.live.videoTrack) return toast('先开始共享电脑声音（共享时会一起拿到画面）');
       this.mirror = this.mirror || new VideoMirror($('#mirror'), () => this.mirrorDelay());
+      this.live.setVideoActive(true);
       this.mirror.start(this.live.videoTrack);
       $('#mirrorBox').hidden = false;
+      // 一键直接全屏（按 Esc 退出全屏，画面窗口还在）
+      $('#mirrorBox').requestFullscreen?.().catch(() => {});
     } else {
       this.mirror?.stop();
+      this.live.setVideoActive(false);
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
       $('#mirrorBox').hidden = true;
     }
   },
