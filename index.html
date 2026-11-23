@@ -4626,6 +4626,16 @@ const host = {
     this.live.addEventListener('state', (e) => this.onLiveState(e.detail));
     setInterval(() => this.tick(), 500);
     window.smHost = this; // 调试用
+    // 控制端被最小化/被游戏挡住时：先把缓冲加大到至少 600ms，回到前台再恢复
+    document.addEventListener('visibilitychange', () => {
+      if (!H.autoDelay) return;
+      if (document.visibilityState === 'hidden' && this.live.running && H.liveDelay < 600) {
+        this.boostFrom = H.liveDelay; H.liveDelay = 600; this.lastBump = Date.now(); this.changed();
+      } else if (document.visibilityState === 'visible' && this.boostFrom) {
+        if (H.liveDelay === 600) H.liveDelay = this.boostFrom; // 期间没有因为卡顿再加大，才恢复原值
+        this.boostFrom = null; this.changed();
+      }
+    });
   },
 
   setCode(code) {
@@ -4736,6 +4746,20 @@ const host = {
   anyNeeds(src) { return Object.values(this.need).some((set) => set.has(src)); },
   onLiveChunk({ frame, ts, l, r }) {
     if (H.currentGroupId !== 'live') return;
+    // 电脑自己处理慢了多少：这段声音采集完到现在过了多久（玩游戏/最小化时 CPU 被抢走会变大）
+    const lag = hostNow() - (ts + 20);
+    this.lagMax = Math.max(this.lagMax || 0, lag);
+    const now = Date.now();
+    if (now - (this.lagWin || 0) > 2000) {
+      this.lagShown = this.lagMax; this.lagMax = 0; this.lagWin = now;
+      // 处理延迟已经吃掉大部分缓冲 → 自动加大（留 150ms 给网络和手机）
+      if (H.autoDelay && this.lagShown + 150 > H.liveDelay && H.liveDelay < 1500) {
+        H.liveDelay = Math.min(1500, Math.ceil((this.lagShown + 200) / 50) * 50);
+        this.lastBump = now;
+        toast(`电脑处理跟不上（慢了 ${Math.round(this.lagShown)} ms），缓冲自动加到 ${H.liveDelay} ms`);
+        this.changed();
+      }
+    }
     this.dispatch('live', ts, [l, r]);
     // 拆声部：只有当有设备需要某个声部时才运行
     if (H.liveStems && STEMS.some((st) => this.anyNeeds('live:' + st))) {
@@ -4873,7 +4897,7 @@ const host = {
     }
     if (Date.now() - (this.lastFull || 0) > 3000) { this.lastFull = Date.now(); this.lastWire = ''; this.publish(); } // 定期重发，防丢
     // 自动调节：连续 20 秒没有设备卡顿，就把缓冲往下压 20ms（最低 100ms），慢慢找到最低又不卡的值
-    if (H.autoDelay && this.live.running && H.liveDelay > 100) {
+    if (H.autoDelay && this.live.running && H.liveDelay > 100 && document.visibilityState === 'visible') {
       const now = Date.now();
       this.lastBump = this.lastBump || now;
       this.lastLower = this.lastLower || now;
@@ -5313,9 +5337,10 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && H.opus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
+    const lagTxt = this.live.running && this.lagShown !== undefined ? ` · 电脑处理延迟 ${Math.round(this.lagShown)} ms` : '';
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
-      ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
+      ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
       : '未在共享';
   },
 
