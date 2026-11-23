@@ -4704,7 +4704,7 @@ const host = {
       const dg = this.dg, clients = [...this.link?.clients.values() || []].filter((c) => c.did);
       dg.log.push({
         t: new Date().toTimeString().slice(0, 8), vis: document.visibilityState[0], foc: document.hasFocus() ? 1 : 0,
-        cap: this.live.running ? 1 : 0, chunks: dg.chunks, gap: Math.round(dg.maxGap), sent: dg.sent,
+        cap: this.live.running ? 1 : 0, chunks: dg.chunks, gap: Math.round(dg.maxGap), sent: dg.sent, sil: dg.silent || 0, pk: Math.round((dg.peak || 0) * 100),
         lag: this.lagShown === undefined ? null : Math.round(this.lagShown), ld: H.liveDelay, ctx: this.live.ctx?.state?.[0] || '-',
         buf: clients.map((c) => Math.round(this.link.buffered(c) / 1024)),
         dev: Object.values(H.devices).filter((d) => d.online && d.id !== 'self').map((d) => {
@@ -4712,12 +4712,12 @@ const host = {
           return [d.name.slice(0, 8), s.live?.got ?? null, s.live?.late ?? null, s.live?.res ?? s.drifts ?? null, s.rtt ?? null, s.jitter ?? null, s.out ?? null, s.hidden ? 1 : 0, s.via === 'backup' ? 'B' : 'P'];
         }),
       });
-      dg.chunks = 0; dg.maxGap = 0; dg.sent = 0;
+      dg.chunks = 0; dg.maxGap = 0; dg.sent = 0; dg.silent = 0; dg.peak = 0;
       if (dg.log.length > 120) dg.log.shift();
     }, 1000);
     $('#diagBtn').onclick = () => {
-      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} UA=${navigator.userAgent}\n列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 处理延迟 缓冲ms 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道]\n`;
-      const txt = head + this.dg.log.map((r) => [r.t, r.vis, r.foc, r.cap, r.chunks, r.gap, r.sent, r.lag, r.ld, r.ctx, JSON.stringify(r.buf), JSON.stringify(r.dev)].join(' ')).join('\n');
+      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} UA=${navigator.userAgent}\n列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 静音片段数 音量峰值 处理延迟 缓冲ms 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道]\n`;
+      const txt = head + this.dg.log.map((r) => [r.t, r.vis, r.foc, r.cap, r.chunks, r.gap, r.sent, `静音${r.sil}`, `峰值${r.pk}`, r.lag, r.ld, r.ctx, JSON.stringify(r.buf), JSON.stringify(r.dev)].join(' ')).join('\n');
       $('#diagOut').hidden = false; $('#diagOut').value = txt;
       navigator.clipboard?.writeText(txt).then(() => toast('诊断记录已复制，直接粘贴给 Claude 就行'), () => toast('自动复制失败：请在下面的框里全选后复制'));
     };
@@ -4850,6 +4850,11 @@ const host = {
     const pn = performance.now();
     if (this.dg.lastChunkAt) this.dg.maxGap = Math.max(this.dg.maxGap, pn - this.dg.lastChunkAt);
     this.dg.lastChunkAt = pn; this.dg.chunks++;
+    // 声音内容：这一段是不是几乎没声（音源本身卡住时会出现一串静音段）
+    let pk = 0;
+    for (let i = 0; i < l.length; i += 4) { const v = Math.abs(l[i]) + Math.abs(r[i]); if (v > pk) pk = v; }
+    if (pk < 0.001) this.dg.silent++;
+    this.dg.peak = Math.max(this.dg.peak || 0, pk);
     if (H.currentGroupId !== 'live') return;
     // 电脑自己处理慢了多少：这段声音采集完到现在过了多久（玩游戏/最小化时 CPU 被抢走会变大）
     const lag = hostNow() - (ts + 20);
