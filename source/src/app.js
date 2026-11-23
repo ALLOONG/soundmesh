@@ -313,7 +313,7 @@ const host = {
       // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
       const late = msg.stats?.live?.late;
       if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 3000) {
-        H.liveDelay = Math.min(3000, H.liveDelay + 250);
+        H.liveDelay = Math.min(3000, H.liveDelay + (H.videoMode ? 30 : 250)); // 看视频模式只回加一点点
         this.lastBump = Date.now();
         toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
         this.changed();
@@ -399,7 +399,7 @@ const host = {
     if (now - (this.lagWin || 0) > 2000) {
       this.lagShown = this.lagMax; this.lagMax = 0; this.lagWin = now;
       // 处理延迟已经吃掉大部分缓冲 → 自动加大（留 150ms 给网络和手机）
-      const margin = H.videoMode ? 40 : 150; // 看视频模式：只给网络和手机留 40ms
+      const margin = H.videoMode ? 25 : 150; // 看视频模式：只给网络和手机留 25ms
       if (H.autoDelay && this.lagShown + margin > H.liveDelay && H.liveDelay < 3000) {
         H.liveDelay = Math.min(3000, Math.ceil((this.lagShown + margin + 30) / 10) * 10);
         this.lastBump = now;
@@ -575,7 +575,11 @@ const host = {
     // 自动调节：一段时间没有设备卡顿，就把缓冲往下压，慢慢找到最低又不卡的值。
     // 看视频模式更积极：6 秒没卡就降 20ms，最低 80ms（声音只比画面晚一点点）
     const anyHidden = Object.values(H.devices).some((d) => d.online && d.stats?.hidden);
-    const floor = H.videoMode ? 80 : 100, calm = H.videoMode ? 6000 : 20000, every = H.videoMode ? 4000 : 10000;
+    // 下限：看视频模式按“最慢那台设备的扬声器延迟 + 35ms 传输处理”自动算（最低 40ms）
+    const outs = Object.values(H.devices).filter((d) => d.online && d.id !== 'self').map((d) => d.stats?.out || 0);
+    const floor = H.videoMode ? Math.max(40, Math.ceil(((outs.length ? Math.max(...outs) : 0) + 35) / 10) * 10) : 100;
+    this.delayFloor = floor;
+    const calm = H.videoMode ? 6000 : 20000, every = H.videoMode ? 4000 : 10000;
     if (H.autoDelay && this.live.running && H.liveDelay > floor && !anyHidden) {
       const now = Date.now();
       this.lastBump = this.lastBump || now;
@@ -1035,7 +1039,7 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && H.opus).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
-    const lagTxt = this.live.running && this.lagShown !== undefined ? ` · 电脑处理延迟 ${Math.round(this.lagShown)} ms` : '';
+    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · 电脑处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '');
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
       ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN} 台用 Opus 压缩、${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
