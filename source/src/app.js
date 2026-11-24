@@ -6,7 +6,7 @@ import { MultiHostLink, AutoNodeLink, packBin } from './transport.js';
 import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder, VideoMirror } from './live.js';
 import { Separator, STEMS, STEM_NAMES } from './separator.js';
 import { searchLyrics, parseLRC, lineAt } from './lyrics.js';
-import { MicRecorder, detectChirps, median, robustMean, analyzeWindows, analyzeResponse, designEq, eqCurve, EQ_FREQS, SWEEP_SEC } from './calib.js';
+import { MicRecorder, detectChirps, median, robustMean, analyzeWindows } from './calib.js';
 
 // ---------------- 后台不降速的计时器 ----------------
 // 标签页切到后台后，浏览器会把 setTimeout/setInterval 降到每秒一次，静音页面 5 分钟后甚至每分钟一次。
@@ -179,7 +179,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'high', aiEq: true, aiVol: true, pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'high', pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -564,8 +564,7 @@ const host = {
       const idx = (id) => g.tracks.findIndex((t) => t.id === id);
       w.p[did] = [r3(pl.gain), r1(pl.delayMs), d.latencyMs,
         pl.sources.map((s) => [idx(s.trackId), s.mix.type === 'lr' ? ['l', r3(s.mix.wl), r3(s.mix.wr)] : s.mix.type === 'ch' ? ['c', s.mix.index] : ['s'], s.filters.map((f) => [f.type[0], Math.round(f.freq)])]),
-        (H.mode === 'split' ? pl.assign.map((k) => assignLabel(H, k)).join(' + ') : '协同播放').slice(0, 60), d.color, d.name, Math.round(pl.azimuth),
-        H.aiEq && d.eq ? [d.eq.pre, ...d.eq.g] : 0];
+        (H.mode === 'split' ? pl.assign.map((k) => assignLabel(H, k)).join(' + ') : '协同播放').slice(0, 60), d.color, d.name, Math.round(pl.azimuth)];
     }
     return w;
   },
@@ -723,15 +722,6 @@ const host = {
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.calibrate();
-    $('#aiBtn').onclick = () => this.aiTune();
-    $('#aiEq').onchange = (e) => { H.aiEq = e.target.checked; this.changed(); };
-    $('#aiVol').onchange = (e) => { H.aiVol = e.target.checked; this.changed(); };
-    $('#aiUndo').onclick = () => {
-      if (!this.aiUndo) return;
-      for (const [id, eq] of Object.entries(this.aiUndo)) if (H.devices[id]) H.devices[id].eq = eq;
-      for (const [id, v] of Object.entries(this.aiVolUndo || {})) if (H.devices[id]) H.devices[id].autoVol = v ?? undefined;
-      this.aiUndo = null; $('#aiUndo').hidden = true; $('#aiOut').innerHTML = '已撤销 AI 校正'; this.changed();
-    };
     $('#checkBtn').onclick = () => this.checkAssign();
     $('#lySearch').onclick = () => this.lySearch();
     $('#lyQ').onkeydown = (e) => e.key === 'Enter' && this.lySearch();
@@ -869,88 +859,6 @@ const host = {
       if (mic?.recorder) try { mic.recorder.stop(); } catch {}
       this.calibrating = false; $('#checkBtn').disabled = false; $('#calibBtn').disabled = false;
     }
-  },
-
-  // AI 音色校正：每台设备轮流扫频，麦克风录音，测出频率响应后自动配均衡
-  async aiTune() {
-    if (this.calibrating) return;
-    const out = (h) => ($('#aiOut').innerHTML = h);
-    const micId = $('#calibMic').value;
-    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
-    if (!devs.length) return toast('还没有在线的播放设备');
-    this.calibrating = true; $('#aiBtn').disabled = true; $('#calibBtn').disabled = true; $('#checkBtn').disabled = true;
-    let recorder = null;
-    try {
-      out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
-      let client = null;
-      if (micId === 'self') {
-        const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
-        recorder = new MicRecorder(ctx, hostNow); await recorder.start();
-      } else ({ client } = await this.openMic(micId));
-      const T0 = hostNow() + 1200, STEP = SWEEP_SEC * 1000 + 900;
-      const noise = { from: T0 + 100, to: T0 + 900 };
-      const windows = devs.map((d, i) => ({ did: d.id, at: T0 + 1100 + i * STEP }));
-      const end = windows[windows.length - 1].at + STEP;
-      for (const w of windows) {
-        if (w.did === 'self') { this.selfEngine.duck(end); this.selfEngine.playSweepAt(w.at); }
-        else for (const c of this.link.clients.values()) if (c.did === w.did) this.link.send(c, { t: 'sweep', at: w.at, until: end });
-      }
-      out(`🔊 各设备轮流播放扫频音，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
-      let res;
-      if (recorder) {
-        await sleep(end - hostNow()); out('🧮 分析中…'); await sleep(30);
-        res = analyzeResponse(recorder.stop(), windows, noise); recorder = null;
-      } else {
-        this.link.send(client, { t: 'measure', kind: 'response', end, windows, noise });
-        const r = await this.waitFor(micId, end - hostNow() + 20000);
-        if (!r || r.t !== 'measureResult') throw new Error('录音设备没有返回结果');
-        res = r.results;
-      }
-      this.lastAiRes = res; // 调试用
-      this.aiUndo = Object.fromEntries(devs.map((d) => [d.id, d.eq || null]));
-      const rows = res.map((r) => {
-        const d = H.devices[r.did], eq = designEq(r.bands);
-        if (d && eq) d.eq = eq;
-        return { d, eq };
-      });
-      if (!rows.some((r) => r.eq)) throw new Error('没有录清楚：把录音设备放近一点、设备音量调大、周围安静再试');
-      // AI 音量平衡：每台设备在听众位的实际响度（含均衡的预留音量）调到一样大。
-      // 以最小声的那台为准（只往下调，不会爆音）；但最多压 12dB，太小声的那台提醒调大它的系统音量。
-      const meas = rows.filter((r) => r.eq && r.d);
-      const eff = meas.map((r) => r.eq.lvl + r.eq.pre), hi = Math.max(...eff), target = Math.max(Math.min(...eff), hi - 12);
-      this.aiVolUndo = Object.fromEntries(meas.map((r) => [r.d.id, r.d.autoVol ?? null]));
-      const quiet = [];
-      meas.forEach((r, i) => {
-        const want = target - eff[i];
-        r.d.autoVol = Math.round(Math.max(-12, Math.min(3, want)) * 10) / 10;
-        r.vol = r.d.autoVol;
-        if (want > 3.5) quiet.push(r.d.name);
-      });
-      H.aiEq = true; H.aiVol = true;
-      out(`✅ AI 校正完成，已自动启用（<span style="color:#ff6b6b">红线</span> = 设备原本的声音，<span style="color:#51cf66">绿线</span> = 校正后，越平直越接近原曲）
-        <table class="small" style="width:100%;margin-top:6px">${rows.map(({ d, eq, vol }) => `<tr><td>${esc(d?.name || '?')}</td><td>${eq ? this.eqSvg(eq) : '<span style="color:var(--bad)">没听清，未校正</span>'}</td><td class="muted">${eq ? this.eqSummary(eq) : ''}${vol !== undefined ? `<div>🔊 音量 ${Math.abs(vol) < 0.5 ? '不用调' : (vol > 0 ? '调大 ' : '调小 ') + Math.abs(vol).toFixed(1) + ' dB'}</div>` : ''}</td></tr>`).join('')}</table>
-        ${quiet.length ? `<div style="color:var(--warn,#f59f00);margin-top:4px">⚠️ ${quiet.map(esc).join('、')} 太小声了，App 里已经调到最大也追不上：请把它的<b>系统音量</b>（手机侧边的音量键）调大，再按一次 AI 校正。</div>` : ''}`);
-      $('#aiUndo').hidden = false;
-      this.changed();
-    } catch (e) {
-      out('❌ ' + esc(e.message || String(e)));
-    } finally {
-      if (recorder) try { recorder.stop(); } catch {}
-      this.calibrating = false; $('#aiBtn').disabled = false; $('#calibBtn').disabled = false; $('#checkBtn').disabled = false;
-    }
-  },
-  // 小图：原本响应 vs 校正后
-  eqSvg(eq) {
-    const W = 150, Hh = 46, y = (db) => Math.max(1, Math.min(Hh - 1, Hh / 2 - db * 1.6)), x = (i) => 6 + i * ((W - 12) / (EQ_FREQS.length - 1));
-    const pts = (f) => EQ_FREQS.map((fc, i) => (eq.dev[i] === null ? null : `${x(i).toFixed(0)},${y(f(i, fc)).toFixed(1)}`)).filter(Boolean).join(' ');
-    return `<svg width="${W}" height="${Hh}" style="background:var(--bg2,#0001);border-radius:4px"><line x1="0" x2="${W}" y1="${Hh / 2}" y2="${Hh / 2}" stroke="#8884"/>
-      <polyline fill="none" stroke="#ff6b6b" stroke-width="1.5" points="${pts((i) => eq.dev[i])}"/>
-      <polyline fill="none" stroke="#51cf66" stroke-width="2" points="${pts((i, fc) => eq.dev[i] + eqCurve(eq.g, fc))}"/></svg>`;
-  },
-  eqSummary(eq) {
-    const name = ['超低音', '低音', '低音', '中低音', '中音', '中音', '中高音', '高音', '高音', '超高音'];
-    const ups = [...new Set(eq.g.map((g, i) => (g >= 1.5 ? name[i] : null)).filter(Boolean))], downs = [...new Set(eq.g.map((g, i) => (g <= -1.5 ? name[i] : null)).filter(Boolean))];
-    return [ups.length ? `补强 ${ups.join('、')}` : '', downs.length ? `压低 ${downs.join('、')}` : ''].filter(Boolean).join('；') || '本身就很平衡';
   },
 
   // 让每台设备轮流“啾”rounds 轮，返回每台设备相对“应有时刻”的误差（毫秒）
@@ -1159,8 +1067,6 @@ const host = {
     $('#liveLevel').style.width = `${Math.min(100, this.live.stats.level * 100)}%`;
     if (document.activeElement !== $('#liveDelay')) $('#liveDelay').value = H.liveDelay;
     $('#liveDelayVal').textContent = `${H.liveDelay} ms`;
-    $('#aiEq').checked = H.aiEq !== false;
-    $('#aiVol').checked = H.aiVol !== false;
     $('#quality').value = H.quality || (H.opus ? 'high' : 'lossless');
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
@@ -1456,11 +1362,11 @@ function decodeWire(w, did) {
   const p = w.p[did];
   const base = { group: g, pb, mode: w.m, ld: w.ld, ly: w.ly, mo: w.mo };
   if (!p || !g) return { ...base, plan: null };
-  const [gain, posDelay, latency, srcs, label, color, name, az, eq] = p;
+  const [gain, posDelay, latency, srcs, label, color, name, az] = p;
   return {
     ...base,
     plan: {
-      gain, posDelay, latency, D: posDelay + latency, label, color, name, az, eq: eq || null,
+      gain, posDelay, latency, D: posDelay + latency, label, color, name, az,
       sources: srcs.filter(([i]) => g.tracks[i]).map(([i, mix, filters]) => ({
         src: g.tracks[i].src,
         mix: mix[0] === 'l' ? { type: 'lr', wl: mix[1], wr: mix[2] } : mix[0] === 'c' ? { type: 'ch', index: mix[1] } : { type: 'stereo' },
@@ -1577,9 +1483,6 @@ const node = {
     } else if (m.t === 'chirp' && Array.isArray(m.at)) {
       if (m.until) this.engine.duck(m.until);
       m.at.forEach((t) => this.engine.playChirpAt(t));
-    } else if (m.t === 'sweep') {
-      if (m.until) this.engine.duck(m.until);
-      if (m.at) this.engine.playSweepAt(m.at);
     } else if (m.t === 'micPrep') {
       (async () => {
         try {
@@ -1593,9 +1496,7 @@ const node = {
         await sleep(Math.max(0, m.end - this.clock.now()));
         const rec = this.rec; this.rec = null;
         const data = rec.stop();
-        const results = m.kind === 'response'
-          ? analyzeResponse(data, m.windows, m.noise)
-          : m.kind === 'spectrum'
+        const results = m.kind === 'spectrum'
           ? analyzeWindows(data, m.windows, m.noise)
           : detectChirps(data, m.slots).map((r) => ({ did: r.did, err: r.err, ok: r.ok }));
         this.link.send({ t: 'measureResult', results });

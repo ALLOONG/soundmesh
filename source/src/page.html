@@ -156,12 +156,6 @@
         <div class="small muted"><b>🔍 分工检查</b>：播放音乐时，各设备轮流单独出声约 2.6 秒，用同一个麦克风录下来，看每台<b>实际</b>放出来的是低音、人声中频、打击还是高频，确认分工有没有生效。</div>
         <div class="row"><button id="checkBtn">开始分工检查</button></div>
         <div id="checkOut" class="small"></div>
-        <hr style="border:0;border-top:1px solid var(--line);width:100%">
-        <div class="small muted"><b>🤖 AI 音色校正</b>：每台设备轮流播放一段从低到高的扫频音（约 2 秒），麦克风在听众位录下来，自动测出每台设备哪些频率太大声、哪些不够，再给它配一套 10 段均衡，同时把各设备的音量调到一样大。手机小喇叭的刺耳高音会被压下去、闷的地方会补回来；设备天生发不出的低音不硬补，避免破音。</div>
-        <label class="small"><input type="checkbox" id="aiEq" /> <b>AI 模式</b>：使用校正后的音色（关掉 = 设备原声，可以对比）</label>
-        <label class="small"><input type="checkbox" id="aiVol" /> <b>AI 音量平衡</b>：按实测把每台设备在你的位置调到一样大（代替按距离估算；每台设备的音量滑块仍可再微调）</label>
-        <div class="row"><button id="aiBtn" class="primary">开始 AI 校正</button><button id="aiUndo" class="small" hidden>撤销</button></div>
-        <div id="aiOut" class="small"></div>
       </section>
 
       <section class="card stack">
