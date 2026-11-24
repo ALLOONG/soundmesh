@@ -1,0 +1,40 @@
+name: Android APK
+
+on:
+  push:
+    paths: ['android/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: 编译 APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace --no-daemon
+      - name: 整理文件
+        run: cp android/app/build/outputs/apk/release/app-release.apk SoundMesh.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SoundMesh-apk
+          path: SoundMesh.apk
+      - name: 发布到“最新版”下载页
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: SoundMesh Android 主机（最新版）
+          files: SoundMesh.apk
+          body: |
+            在手机上点下面的 **SoundMesh.apk** 下载并安装（需要允许“安装未知来源应用”）。
+            需要 Android 10 或以上。版本 ${{ github.run_number }}，代码 ${{ github.sha }}

@@ -88,7 +88,7 @@ const PB_CODE = { stopped: 0, playing: 1, paused: 2 }, PB_NAME = ['stopped', 'pl
 function liveGroup(stems) {
   const tracks = [{ id: 'live', name: '完整混音', src: 'live', channels: 2, duration: 0, role: 'mix' }];
   if (stems) for (const st of STEMS) tracks.push({ id: 'lv-' + st, name: STEM_NAMES[st], src: 'live:' + st, channels: 1, duration: 0, role: st });
-  return { id: 'live', name: '电脑实时音源（YouTube / Spotify…）', kind: 'live', loop: false, duration: 0, tracks };
+  return { id: 'live', name: window.SoundMeshApp ? '手机实时音源（YouTube Music / Spotify…）' : '电脑实时音源（YouTube / Spotify…）', kind: 'live', loop: false, duration: 0, tracks };
 }
 // 歌曲当前位置（秒），用于歌词滚动。ly = { a, s, o }：实时音源用“点一句对准”的锚点，文件用播放进度 + 偏移
 function songPos(t, cur, ly) {
@@ -524,6 +524,12 @@ const host = {
     const autoSelf = !this.selfEngine && H.pcPlay !== false;
     if (autoSelf) this.toggleSelf();
     try {
+      if (window.SoundMeshApp) {
+        // Android App：抓手机上其他 App 的声音。原 App 会在这台手机上照常出声（比其他设备早），所以这台先不跟着出声
+        if (autoSelf && this.selfEngine) this.toggleSelf();
+        await this.live.startFromAndroid();
+        return;
+      }
       await this.live.startCapture();
       if (this.live.surface !== 'browser' && this.selfEngine) {
         // 共享窗口/整个屏幕时抓的是系统声音：电脑原声不会被静音，本机再出声还会被重新抓进去形成回声
@@ -1071,7 +1077,7 @@ const host = {
   renderLive() {
     if ($('#livePanel').hidden) return;
     const on = this.live.running;
-    $('#liveBtn').textContent = on ? '■ 停止共享' : '🎙 开始共享电脑声音';
+    $('#liveBtn').textContent = on ? '■ 停止共享' : window.SoundMeshApp ? '🎙 开始抓手机声音' : '🎙 开始共享电脑声音';
     $('#liveBtn').className = on ? 'danger' : 'primary';
     $('#liveLevel').style.width = `${Math.min(100, this.live.stats.level * 100)}%`;
     if (document.activeElement !== $('#liveDelay')) $('#liveDelay').value = H.liveDelay;
@@ -1087,10 +1093,10 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => c.opus && this.useOpus()).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
-    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · 电脑处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
-    const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️' }[this.live.surface] || '未知';
+    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
+    const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️', android: '手机 App 声音 ✅' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
-      ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN ? `${opusN} 台用 Opus ${H.quality === 'standard' ? '160' : '320'}kbps、` : ''}${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
+      ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface === 'android' ? '（这台手机会照常播放原声，比其他设备早一点）' : this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN ? `${opusN} 台用 Opus ${H.quality === 'standard' ? '160' : '320'}kbps、` : ''}${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
       : '未在共享';
   },
 
@@ -1619,7 +1625,7 @@ const node = {
     $('#vol').style.width = `${Math.min(100, (plan?.gain || 0) * 100)}%`;
     if (cur?.pb) {
       const pb = cur.pb, g = cur.group;
-      if (isLive) $('#pbLine').textContent = `🔴 电脑实时音源 · ${pb.status === 'playing' ? `正在接收（缓冲 ${cur.ld} ms）` : '控制端还没开始共享'}`;
+      if (isLive) $('#pbLine').textContent = `🔴 ${window.SoundMeshApp || cur.app ? '手机' : '电脑'}实时音源 · ${pb.status === 'playing' ? `正在接收（缓冲 ${cur.ld} ms）` : '控制端还没开始共享'}`;
       else {
         const pos = pb.status === 'playing' ? Math.max(pb.o, pb.o + (this.clock.now() - pb.S) / 1000) : pb.o;
         const st = { playing: '▶ 播放中', paused: '❚❚ 已暂停', stopped: '■ 已停止' }[pb.status];

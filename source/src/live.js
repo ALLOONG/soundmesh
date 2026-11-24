@@ -65,6 +65,49 @@ export class LiveCapture extends EventTarget {
     return this.startFromStream(stream);
   }
 
+  // 在 SoundMesh Android App 里：由 App 抓手机上其他 App（YouTube Music、Spotify…）的声音交给页面
+  async startFromAndroid() {
+    const A = window.SoundMeshApp;
+    if (!A) throw new Error('只有在 SoundMesh Android App 里才能抓手机声音');
+    await this.stop();
+    const ok = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('等待授权超时')), 120000);
+      window.__smAppCapture = (state, msg) => {
+        if (state === 'on') { clearTimeout(t); resolve(true); }
+        else if (state === 'denied') { clearTimeout(t); reject(Object.assign(new Error('已取消'), { name: 'NotAllowedError' })); }
+        else if (state === 'error') { clearTimeout(t); reject(new Error(msg || '手机抓声音失败')); }
+        else if (state === 'off' && this.mode === 'android') this.stop();
+      };
+      A.startCapture();
+    });
+    if (!ok) return;
+    this.mode = 'android'; this.surface = 'android'; this.stream = null; this.videoTrack = null;
+    this.anchor = null; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
+    this.pend = [new Float32Array(FRAMES), new Float32Array(FRAMES)]; this.pi = 0; this.chunkFrame = 0; this.nextFrame = null;
+    this.running = true;
+    // 每 10ms 向 App 取一次新录到的声音（16 位立体声，base64）
+    this.poll = setInterval(() => {
+      if (!this.running) return;
+      let s;
+      try { s = A.read(); } catch { return; }
+      if (!s) return;
+      const bar = s.indexOf('|'), start = Number(s.slice(0, bar)), bin = atob(s.slice(bar + 1));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const pcm = new Int16Array(bytes.buffer, 0, bytes.length >> 1), n = pcm.length >> 1;
+      // App 那边缓冲满了丢掉的部分：补同样长度的静音，时间线保持正确
+      if (this.nextFrame !== null && start > this.nextFrame) {
+        const gap = Math.min(SR * 5, start - this.nextFrame);
+        this.push(new Float32Array(gap), new Float32Array(gap));
+      }
+      this.nextFrame = start + n;
+      const L = new Float32Array(n), R = new Float32Array(n);
+      for (let i = 0; i < n; i++) { L[i] = pcm[2 * i] / 32768; R[i] = pcm[2 * i + 1] / 32768; }
+      this.push(L, R);
+    }, 10);
+    this.emit('state', true);
+  }
+
   async startFromStream(stream) {
     await this.stop();
     this.stream = stream;
@@ -206,6 +249,7 @@ export class LiveCapture extends EventTarget {
   async stop() {
     if (!this.running && !this.stream) return;
     this.running = false;
+    if (this.mode === 'android') { clearInterval(this.poll); try { window.SoundMeshApp?.stopCapture(); } catch {} this.mode = null; }
     try { this.reader?.cancel(); } catch {}
     this.reader = null;
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
