@@ -465,7 +465,10 @@ const host = {
     const plans = Object.values(this.plans());
     const avgD = plans.length ? plans.reduce((a, p) => a + p.delayMs, 0) / plans.length : 0;
     const avgLat = Object.values(H.devices).filter((d) => d.online).reduce((a, d, _, arr) => a + d.latencyMs / arr.length, 0);
-    return Math.max(0, H.liveDelay + avgD + avgLat + (H.mirrorOffset || 0));
+    // 校准测到的“真实到达比预定晚多少”，再减去电脑本身播放 YouTube 时的输出延迟（YouTube 画面是按那个时间对齐的）
+    const real = Number.isFinite(H.avBase) ? H.avBase : 0;
+    const pcOut = ((this.selfEngine?.ctx || this.calCtx)?.outputLatency || 0) * 1000;
+    return Math.max(0, H.liveDelay + avgD + avgLat + real - pcOut + (H.mirrorOffset || 0));
   },
   toggleMirror(on) {
     if (on === undefined) on = $('#mirrorBox').hidden;
@@ -925,6 +928,11 @@ const host = {
       // 第 2 步：再测 3 轮验证；还有超过 0.3ms 的偏差就再修正一次
       const check = await this.measureChirps(valid.map((r) => r.d), micId, 3, out, '第 2 步：验证校准结果');
       const cv = check.filter((r) => r.val !== null), ref2 = cv.length ? median(cv.map((r) => r.val)) : 0;
+      // 顺便算出“声音真正到你耳朵比预定晚多少”（手机喇叭/蓝牙的真实延迟，浏览器报的数字常常不准），
+      // 看视频时画面就按这个自动延后，不用手动微调
+      const plansNow = this.plans(), Dof = (d) => (plansNow[d.id]?.delayMs || 0) + (d.latencyMs || 0);
+      const eList = cv.length ? cv.map((c) => c.val - Dof(c.d)) : [];
+      if (eList.length) { H.avBase = Math.round(median(eList) * 10) / 10; H.avCalAt = Date.now(); }
       for (const c of cv) {
         const row = rows.find((r) => r.d === c.d);
         row.resid = c.val - ref2;
@@ -937,6 +945,7 @@ const host = {
           <td>${r.val === null ? `<span style="color:var(--bad)">没听清（${r.n}/5）</span>` : `原本${r.first > 0 ? '晚' : '早'} ${Math.abs(r.first).toFixed(1)} ms`}</td>
           <td>${r.resid === undefined ? (r.val === null ? '未调整' : '验证没听清') : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms${r.fixed ? '（已再修正）' : ''}`}</td>
           <td class="muted">微调 → ${r.d.latencyMs} ms</td></tr>`).join('')}</table>`);
+      if (eList.length) $('#calibOut').insertAdjacentHTML('beforeend', `<div class="muted" style="margin-top:4px">🎬 声音实际到你耳朵比预定${H.avBase >= 0 ? '晚' : '早'} ${Math.abs(H.avBase).toFixed(0)} ms，看视频时画面会自动多延后这么多（YouTube 画面延后扩展 / 全屏同步画面都会用到）</div>`);
       $('#calibUndo').hidden = false;
       this.changed();
     } catch (e) {

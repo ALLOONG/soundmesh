@@ -217,7 +217,12 @@ export class Engine extends EventTarget {
   outputCtxNow() {
     const ts = this.ctx.getOutputTimestamp?.();
     if (ts && ts.performanceTime > 0 && this.ctx.state === 'running') {
-      return ts.contextTime + (performance.now() - ts.performanceTime) / 1000;
+      // 手机浏览器给的“播放时间”每次会跳几毫秒：不直接用，而是平滑成一条稳定的对应关系
+      // （声卡和系统时钟的快慢差会被慢慢跟上；突然变很多——比如切后台回来——就直接采用新值）
+      const pn = performance.now(), off = ts.contextTime - ts.performanceTime / 1000;
+      if (this.mapOff === undefined || Math.abs(off - this.mapOff) > 0.02) this.mapOff = off;
+      else this.mapOff += (off - this.mapOff) * 0.03;
+      return this.mapOff + pn / 1000;
     }
     return this.ctx.currentTime - (this.ctx.outputLatency || this.ctx.baseLatency || 0);
   }
@@ -365,15 +370,20 @@ export class Engine extends EventTarget {
     if (expected + buffer.duration < now + 0.005) { this.liveStats.late++; return; } // 来得太晚，丢掉
     let when, rate = 1;
     const cursor = this.liveCursor.get(srcName) ?? null;
+    const ema = this.liveErr || (this.liveErr = new Map());
     if (cursor === null || Math.abs(cursor - expected) > 0.04) {
       when = this.at(Math.max(expected, now + 0.005));
       this.liveStats.resyncs++;
+      ema.set(srcName, 0);
     } else {
-      // 紧接上一段播放（无缝）。误差 2ms 以内完全不变速（音高 100% 原样）；
-      // 平时只用 ±0.07% 慢慢追（约 1 音分，人耳听不出）；只有缓冲刚调整、误差超过 15ms 时才用到 ±0.3%
+      // 紧接上一段播放（无缝）。误差先做平均（约 1 秒），滤掉时间读数的抖动，再用极小的变速持续追平：
+      // 设备时钟快/慢几十 ppm 时只需要 0.005% 左右的变速（完全听不出），各设备都能稳定在 0.5ms 以内。
+      // 只有缓冲刚调整、误差超过 15ms 时才用到 ±0.3%
       when = this.at(cursor); // 对齐到采样点（变速后的接缝最多差半个采样点，约 0.01ms，听不出）
-      const err = cursor - expected, lim = Math.abs(err) > 0.015 ? 0.003 : 0.0007;
-      rate = Math.abs(err) < 0.002 ? 1 : 1 + Math.max(-lim, Math.min(lim, err * 2));
+      const raw = cursor - expected, e = (ema.get(srcName) ?? raw) * 0.95 + raw * 0.05;
+      ema.set(srcName, e);
+      const lim = Math.abs(e) > 0.015 ? 0.003 : 0.0007;
+      rate = Math.abs(e) < 0.0001 ? 1 : 1 + Math.max(-lim, Math.min(lim, e * 3));
     }
     const src = this.ctx.createBufferSource();
     src.buffer = buffer;

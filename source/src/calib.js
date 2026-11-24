@@ -49,6 +49,9 @@ export class MicRecorder {
       URL.revokeObjectURL(url);
       this.ctx.__smRec = true;
     }
+    // 麦克风本身的输入延迟（录到的声音比实际晚这么多），之后从测量结果里扣掉，才能算出声音真正到达的时刻
+    const st = this.stream.getAudioTracks()[0]?.getSettings?.() || {};
+    this.inLat = Number.isFinite(st.latency) && st.latency > 0 && st.latency < 0.3 ? st.latency : (this.ctx.baseLatency || 0.01);
     this.src = this.ctx.createMediaStreamSource(this.stream);
     this.node = new AudioWorkletNode(this.ctx, 'sm-rec', { channelCount: 1, channelCountMode: 'explicit' });
     const mute = this.ctx.createGain(); mute.gain.value = 0;
@@ -66,7 +69,7 @@ export class MicRecorder {
     this.stream.getTracks().forEach((t) => t.stop());
     const n = this.chunks.reduce((a, c) => a + c.length, 0), rec = new Float32Array(n);
     let o = 0; for (const c of this.chunks) { rec.set(c, o); o += c.length; }
-    return { rec, sr: this.ctx.sampleRate, startHost: this.startHost };
+    return { rec, sr: this.ctx.sampleRate, startHost: this.startHost, inLat: this.inLat || 0 };
   }
 }
 
@@ -74,7 +77,7 @@ export class MicRecorder {
 // 返回每个 slot 的误差（毫秒，正数 = 实际比应有的晚）
 // 做法：用 FFT 算互相关，再取“包络”（不会因为波形一正一负而跳半个周期），
 // 找最早到达的那个峰（不是墙壁反射回来的），再用抛物线插值精确到不到 1 个采样点（约 0.02ms）
-export function detectChirps({ rec, sr, startHost }, slots) {
+export function detectChirps({ rec, sr, startHost, inLat = 0 }, slots) {
   const tpl = makeChirp(sr), m = tpl.length;
   const before = Math.round(0.3 * sr), after = Math.round(0.5 * sr);
   let N = 1; while (N < before + after + m * 2) N <<= 1;
@@ -109,7 +112,7 @@ export function detectChirps({ rec, sr, startHost }, slots) {
     const sorted = Array.from(env).sort((x, y) => x - y);
     const noise = sorted[Math.floor(sorted.length * 0.5)] || 1e-12;
     const ratio = y1 / noise;
-    const err = startHost + ((a + pk + frac) / sr) * 1000 - s.at;
+    const err = startHost + ((a + pk + frac) / sr) * 1000 - inLat * 1000 - s.at;
     return { ...s, err, ratio, ok: ratio > 8 };
   });
 }

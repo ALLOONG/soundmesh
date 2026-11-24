@@ -172,18 +172,28 @@ export class LiveCapture extends EventTarget {
     this.node.port.onmessage = (e) => this.onChunk(e.data);
   }
 
-  // 采集帧号 -> 控制端时钟（毫秒）
-  tsOf(frame) { return this.anchor.host + ((frame - this.anchor.frame) / SR) * 1000; }
+  // 采集帧号 -> 控制端时钟（毫秒）。时间线连续推进，速度由下面的“跟踪”慢慢调整，不会跳
+  tsOf() { return this.tsNext; }
   onChunk({ frame, l, r }) {
-    const now = this.hostNow();
-    if (!this.anchor) this.anchor = { host: now - (FRAMES / SR) * 1000, frame };
-    const ts = this.tsOf(frame);
-    // 长期漂移校正：只看 3 秒内“处理得最及时”的那一段。电脑忙导致的处理延迟只会让数值变大，
-    // 取最小值就能把它排除掉，不会因为电脑一时卡顿就把时间戳调偏（那样会让设备反复重新对齐）
-    const err = now - (ts + (FRAMES / SR) * 1000);
+    const now = this.hostNow(), step = (FRAMES / SR) * 1000;
+    if (!this.anchor) { this.anchor = { host: now - step, frame }; this.tsNext = now - step; this.k = 1; this.kI = 0; this.lastFrame = frame - FRAMES; }
+    // 中间丢了帧（重新共享等）：时间线照帧数补上
+    if (frame - this.lastFrame > FRAMES) this.tsNext += ((frame - this.lastFrame - FRAMES) / SR) * 1000 * this.k;
+    this.lastFrame = frame;
+    const ts = this.tsNext;
+    this.tsNext += step * this.k;
+    // 长期漂移跟踪：只看 3 秒内“处理得最及时”的那一段（电脑忙只会让数值变大，取最小值就排除了）。
+    // 不再一次跳 10~20ms，而是微调时间线的速度（最多 ±0.3%），几秒内平滑追上；
+    // 同时记住声卡时钟的快慢差，之后就几乎不用再追
+    const err = now - (ts + step);
     this.minErr = Math.min(this.minErr, err);
     if (++this.errN >= 150) {
-      if (Math.abs(this.minErr) > 10) this.anchor.host += this.minErr;
+      const e = this.minErr, win = 150 * step;
+      if (Math.abs(e) > 300) { this.tsNext += e; } // 电脑长时间卡住之类的大偏差：直接跳
+      else {
+        this.kI = Math.max(-0.003, Math.min(0.003, this.kI + (e / win) * 0.15));
+        this.k = 1 + Math.max(-0.003, Math.min(0.003, this.kI + (e / win) * 0.6));
+      }
       this.minErr = Infinity; this.errN = 0;
     }
     let peak = 0;
