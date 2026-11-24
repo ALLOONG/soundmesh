@@ -22,7 +22,9 @@ export class Engine extends EventTarget {
     this.liveStats = { got: 0, late: 0, resyncs: 0, err: null };
     this.liveSources = new Set();
     const AC = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new AC({ latencyHint: 'interactive' });
+    // 统一用 48kHz：和传输的音频一致，不用在播放时用粗糙的线性插值换采样率
+    // （硬件不是 48k 的手机，由浏览器在最后输出时用高质量方式转换）
+    try { this.ctx = new AC({ latencyHint: 'interactive', sampleRate: 48000 }); } catch { this.ctx = new AC({ latencyHint: 'interactive' }); }
     this.master = this.ctx.createGain();
     this.master.connect(this.ctx.destination);
     this.deviceGain = this.ctx.createGain();
@@ -58,6 +60,8 @@ export class Engine extends EventTarget {
     });
   }
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
+  // 把开始时间对齐到整数采样点：浏览器遇到“半个采样点”的开始时间会做插值，悄悄削掉高音
+  at(t) { const sr = this.ctx.sampleRate; return Math.round(t * sr) / sr; }
 
   async unlock() { // 必须在点击事件里调用
     await this.ctx.resume();
@@ -162,7 +166,7 @@ export class Engine extends EventTarget {
     const s = this.ctx.createBufferSource(), g = this.ctx.createGain();
     s.buffer = this.chirpBuf; g.gain.value = 0.9;
     s.connect(g).connect(this.master);
-    s.start(when);
+    s.start(this.at(when));
     return true;
   }
 
@@ -250,7 +254,7 @@ export class Engine extends EventTarget {
     const when = this.clockToCtx(at);
     if (when < this.ctx.currentTime + 0.01) return false;
     const s = this.ctx.createBufferSource();
-    s.buffer = this.sweepBuf; s.connect(this.master); s.start(when);
+    s.buffer = this.sweepBuf; s.connect(this.master); s.start(this.at(when));
     return true;
   }
 
@@ -304,7 +308,7 @@ export class Engine extends EventTarget {
       if (off >= buf.duration) return;
       const v = this.buildVoice(buf, s, group.loop);
       v.idx = idx;
-      v.src.start(ctxT, Math.max(0, off));
+      { const sr = this.ctx.sampleRate; v.src.start(this.at(ctxT), Math.round(Math.max(0, off) * sr) / sr); }
       this.voices.push(v);
     });
     this.anchor = { ctxT, p, D };
@@ -392,12 +396,12 @@ export class Engine extends EventTarget {
     let when, rate = 1;
     const cursor = this.liveCursor.get(srcName) ?? null;
     if (cursor === null || Math.abs(cursor - expected) > 0.04) {
-      when = Math.max(expected, now + 0.005);
+      when = this.at(Math.max(expected, now + 0.005));
       this.liveStats.resyncs++;
     } else {
       // 紧接上一段播放（无缝）。误差 2ms 以内完全不变速（音高 100% 原样）；
       // 平时只用 ±0.07% 慢慢追（约 1 音分，人耳听不出）；只有缓冲刚调整、误差超过 15ms 时才用到 ±0.3%
-      when = cursor;
+      when = this.at(cursor); // 对齐到采样点（变速后的接缝最多差半个采样点，约 0.01ms，听不出）
       const err = cursor - expected, lim = Math.abs(err) > 0.015 ? 0.003 : 0.0007;
       rate = Math.abs(err) < 0.002 ? 1 : 1 + Math.max(-lim, Math.min(lim, err * 2));
     }

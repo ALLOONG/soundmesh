@@ -2,11 +2,12 @@ import { FFT } from './separator.js';
 // 麦克风自动校准：每台设备在指定时刻播放一段扫频“啾”声，听众位的麦克风录下来，
 // 用互相关找出每台设备实际出声的时间，算出各自的固定延迟差。
 
-const CHIRP_SEC = 0.04;
+const CHIRP_SEC = 0.05;
 
+// 宽频“啾”：1kHz → 12kHz。频带越宽，峰越尖，定位越准（手机小喇叭也放得出来）
 export function makeChirp(sr) {
   const n = Math.round(sr * CHIRP_SEC), out = new Float32Array(n);
-  const f0 = 1500, f1 = 6000, T = CHIRP_SEC;
+  const f0 = 1000, f1 = Math.min(12000, sr * 0.45), T = CHIRP_SEC;
   for (let i = 0; i < n; i++) {
     const t = i / sr;
     const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)); // Hann 窗
@@ -71,28 +72,54 @@ export class MicRecorder {
 
 // slots: [{ did, at }]，at = 该设备“应该”在听众位被听到的控制端时间
 // 返回每个 slot 的误差（毫秒，正数 = 实际比应有的晚）
+// 做法：用 FFT 算互相关，再取“包络”（不会因为波形一正一负而跳半个周期），
+// 找最早到达的那个峰（不是墙壁反射回来的），再用抛物线插值精确到不到 1 个采样点（约 0.02ms）
 export function detectChirps({ rec, sr, startHost }, slots) {
   const tpl = makeChirp(sr), m = tpl.length;
-  let tplE = 0; for (let i = 0; i < m; i++) tplE += tpl[i] * tpl[i];
+  const before = Math.round(0.3 * sr), after = Math.round(0.5 * sr);
+  let N = 1; while (N < before + after + m * 2) N <<= 1;
+  const fft = new FFT(N);
+  const tr = new Float64Array(N), ti = new Float64Array(N);
+  for (let i = 0; i < m; i++) tr[i] = tpl[i];
+  fft.run(tr, ti, false);
   return slots.map((s) => {
     const center = Math.round(((s.at - startHost) / 1000) * sr);
-    const a = Math.max(0, center - Math.round(0.3 * sr)), b = Math.min(rec.length - m, center + Math.round(0.5 * sr));
-    if (b <= a) return { ...s, ok: false };
-    let best = -Infinity, bestI = -1;
-    const vals = new Float32Array(b - a);
-    for (let i = a; i < b; i++) {
-      let acc = 0;
-      for (let j = 0; j < m; j++) acc += rec[i + j] * tpl[j];
-      const v = Math.abs(acc);
-      vals[i - a] = v;
-      if (v > best) { best = v; bestI = i; }
+    const a = center - before, len = before + after + m;
+    if (a < 0 || a + len > rec.length) return { ...s, ok: false };
+    const re = new Float64Array(N), im = new Float64Array(N);
+    for (let i = 0; i < len; i++) re[i] = rec[a + i];
+    fft.run(re, im, false);
+    // Y × conj(X)，只保留正频率（×2）→ 反变换后取模 = 互相关的包络
+    for (let k = 0; k < N; k++) {
+      if (k > N / 2) { re[k] = 0; im[k] = 0; continue; }
+      const xr = tr[k], xi = -ti[k], yr = re[k], yi = im[k], w = k === 0 || k === N / 2 ? 1 : 2;
+      re[k] = (yr * xr - yi * xi) * w; im[k] = (yr * xi + yi * xr) * w;
     }
-    const sorted = Array.from(vals).sort((x, y) => x - y);
-    const noise = sorted[Math.floor(sorted.length * 0.5)] || 1e-9;
-    const ratio = best / noise;
-    const err = startHost + (bestI / sr) * 1000 - s.at;
+    fft.run(re, im, true);
+    const L = before + after, env = new Float64Array(L);
+    let best = 0, bi = 0;
+    for (let i = 0; i < L; i++) { env[i] = Math.hypot(re[i], im[i]); if (env[i] > best) { best = env[i]; bi = i; } }
+    // 最早到达：最高峰之前 4ms 内，如果有一个超过最高峰 60% 的峰，那才是直达声（后面的是反射）
+    let pk = bi;
+    for (let i = Math.max(1, bi - Math.round(0.004 * sr)); i < bi; i++) {
+      if (env[i] >= best * 0.6 && env[i] >= env[i - 1] && env[i] >= env[i + 1]) { pk = i; break; }
+    }
+    const y0 = env[pk - 1] || 0, y1 = env[pk], y2 = env[pk + 1] || 0, den = y0 - 2 * y1 + y2;
+    const frac = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
+    const sorted = Array.from(env).sort((x, y) => x - y);
+    const noise = sorted[Math.floor(sorted.length * 0.5)] || 1e-12;
+    const ratio = y1 / noise;
+    const err = startHost + ((a + pk + frac) / sr) * 1000 - s.at;
     return { ...s, err, ratio, ok: ratio > 8 };
   });
+}
+
+// 稳健的“代表值”：先取中位数，再把离中位数 0.5ms 以内的结果取平均（去掉偶尔的误判）
+export function robustMean(arr) {
+  const med = median(arr);
+  if (med === null) return null;
+  const near = arr.filter((v) => Math.abs(v - med) <= 0.5);
+  return near.length ? near.reduce((a, b) => a + b, 0) / near.length : med;
 }
 
 export const median = (arr) => { const a = [...arr].sort((x, y) => x - y); return a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2) : null; };
@@ -166,7 +193,7 @@ export const THIRD_OCT = (() => { const a = []; for (let k = -16; k <= 13; k++) 
 // 一段信号的“能量谱”（Welch 平均，N 点，50% 重叠，汇总成每个频点的能量）
 function energySpectrum(sig, a, b, fft, N, hann) {
   const out = new Float64Array(N / 2), re = new Float64Array(N), im = new Float64Array(N);
-  for (let s = a; s < b; s += N / 2) {
+  for (let s = a; s < b; s += hann[0] === 1 ? N : N / 2) {
     for (let i = 0; i < N; i++) { const j = s + i, v = j < b && j >= 0 && j < sig.length ? sig[j] : 0; re[i] = v * hann[i]; im[i] = 0; }
     fft.run(re, im, false);
     for (let k = 0; k < N / 2; k++) out[k] += re[k] * re[k] + im[k] * im[k];
@@ -177,18 +204,25 @@ function energySpectrum(sig, a, b, fft, N, hann) {
 // windows: [{ did, at }]（扫频开始的控制端时间）；noise: { from, to }
 // 返回每台设备在 1/3 倍频程各频带的响应（dB，相对值）和该频带是否听得清
 export function analyzeResponse({ rec, sr, startHost }, windows, noise) {
-  const N = 8192, fft = new FFT(N), hann = new Float64Array(N);
-  for (let i = 0; i < N; i++) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N);
+  // 整段一次 FFT（扫频完整落在这段里，前后都是静音），每个频率被计入的分量完全一样，不会因为时间位置而偏差
   const idx = (t) => Math.round(((t - startHost) / 1000) * sr);
   const len = Math.round((SWEEP_SEC + 0.55) * sr); // 扫频长度 + 设备输出延迟/房间余响的余量
-  const sweep = makeSweep(sr);
-  const X = energySpectrum(sweep, 0, len, fft, N, hann);
+  let N = 1; while (N < len) N <<= 1;
+  const fft = new FFT(N), ones = new Float64Array(N).fill(1);
+  const whole = (sig, a, b) => energySpectrum(sig, a, b, fft, N, ones);
+  const X = whole(makeSweep(sr), 0, len);
+  // 底噪：用较短的一段估算，换算到同样长度
+  const Nw = 8192, fftN = new FFT(Nw), hann = new Float64Array(Nw);
+  for (let i = 0; i < Nw; i++) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Nw);
   const na = Math.max(0, idx(noise.from)), nb = Math.min(rec.length, idx(noise.to));
-  const Nn = energySpectrum(rec, na, nb, fft, N, hann), nScale = len / Math.max(1, nb - na);
+  const Nn0 = energySpectrum(rec, na, nb, fftN, Nw, hann), segs = Math.max(1, Math.ceil((nb - na) / (Nw / 2)));
+  const Nn = new Float64Array(N / 2), ratio = N / Nw;
+  for (let k = 0; k < N / 2; k++) Nn[k] = (Nn0[Math.min(Nw / 2 - 1, Math.floor(k / ratio))] / segs / 0.375) * (len / Nw) / ratio;
+  const nScale = 1;
   const binHz = sr / N;
   return windows.map((w) => {
     const a = Math.max(0, idx(w.at) - Math.round(0.05 * sr));
-    const Y = energySpectrum(rec, a, Math.min(rec.length, a + len), fft, N, hann);
+    const Y = whole(rec, a, Math.min(rec.length, a + len));
     const bands = THIRD_OCT.map((fc) => {
       const lo = fc / 2 ** (1 / 6), hi = fc * 2 ** (1 / 6);
       let y = 0, x = 0, nz = 0;
@@ -240,5 +274,5 @@ export function designEq(bands) {
   let peak = 0;
   for (let f = 25; f < 20000; f *= 1.05) peak = Math.max(peak, eqCurve(g, f));
   const r1 = (v) => Math.round(v * 10) / 10;
-  return { g: g.map(r1), pre: r1(-peak - 0.5), dev: EQ_FREQS.map((fc) => { const n = bands.filter((b) => b.f >= fc / Math.SQRT2 && b.f <= fc * Math.SQRT2); return n.length ? r1(n.reduce((a, b) => a + b.db, 0) / n.length - ref) : null; }) };
+  return { lvl: r1(ref), g: g.map(r1), pre: r1(-peak - 0.5), dev: EQ_FREQS.map((fc) => { const n = bands.filter((b) => b.f >= fc / Math.SQRT2 && b.f <= fc * Math.SQRT2); return n.length ? r1(n.reduce((a, b) => a + b.db, 0) / n.length - ref) : null; }) };
 }

@@ -209,12 +209,14 @@ export function computeMix(room) {
   for (const d of devs) {
     const g = geo[d.id];
     let gain = 1;
-    if (opt.distanceGain) {
+    if (room.aiVol && Number.isFinite(d.autoVol) && room.gainPreset !== 'focus') {
+      gain = 10 ** (d.autoVol / 20); // AI 音量平衡：用麦克风在听众位实测的结果（比按距离估算准）
+    } else if (opt.distanceGain) {
       if (room.gainPreset === 'focus') gain = Math.pow(dmin / g.d, 1.5); // 近的更响
       else gain = g.d / dmax; // 平衡：近的减小，到听众位响度一致
     }
     const delayMs = opt.distanceDelay ? ((dmax - g.d) / SPEED_OF_SOUND) * 1000 : 0;
-    base[d.id] = { gain: clamp(gain, 0.05, 1), delayMs, pan: g.pan };
+    base[d.id] = { gain: clamp(gain, 0.05, 1.42), delayMs, pan: g.pan };
   }
 
   // 2) 分配声源

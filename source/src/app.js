@@ -6,7 +6,7 @@ import { MultiHostLink, AutoNodeLink, packBin } from './transport.js';
 import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder, VideoMirror } from './live.js';
 import { Separator, STEMS, STEM_NAMES } from './separator.js';
 import { searchLyrics, parseLRC, lineAt } from './lyrics.js';
-import { MicRecorder, detectChirps, median, analyzeWindows, analyzeResponse, designEq, eqCurve, EQ_FREQS, SWEEP_SEC } from './calib.js';
+import { MicRecorder, detectChirps, median, robustMean, analyzeWindows, analyzeResponse, designEq, eqCurve, EQ_FREQS, SWEEP_SEC } from './calib.js';
 
 // ---------------- 后台不降速的计时器 ----------------
 // 标签页切到后台后，浏览器会把 setTimeout/setInterval 降到每秒一次，静音页面 5 分钟后甚至每分钟一次。
@@ -179,7 +179,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'high', aiEq: true, pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'high', aiEq: true, aiVol: true, pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -725,9 +725,11 @@ const host = {
     $('#calibBtn').onclick = () => this.calibrate();
     $('#aiBtn').onclick = () => this.aiTune();
     $('#aiEq').onchange = (e) => { H.aiEq = e.target.checked; this.changed(); };
+    $('#aiVol').onchange = (e) => { H.aiVol = e.target.checked; this.changed(); };
     $('#aiUndo').onclick = () => {
       if (!this.aiUndo) return;
       for (const [id, eq] of Object.entries(this.aiUndo)) if (H.devices[id]) H.devices[id].eq = eq;
+      for (const [id, v] of Object.entries(this.aiVolUndo || {})) if (H.devices[id]) H.devices[id].autoVol = v ?? undefined;
       this.aiUndo = null; $('#aiUndo').hidden = true; $('#aiOut').innerHTML = '已撤销 AI 校正'; this.changed();
     };
     $('#checkBtn').onclick = () => this.checkAssign();
@@ -904,6 +906,7 @@ const host = {
         if (!r || r.t !== 'measureResult') throw new Error('录音设备没有返回结果');
         res = r.results;
       }
+      this.lastAiRes = res; // 调试用
       this.aiUndo = Object.fromEntries(devs.map((d) => [d.id, d.eq || null]));
       const rows = res.map((r) => {
         const d = H.devices[r.did], eq = designEq(r.bands);
@@ -911,9 +914,22 @@ const host = {
         return { d, eq };
       });
       if (!rows.some((r) => r.eq)) throw new Error('没有录清楚：把录音设备放近一点、设备音量调大、周围安静再试');
-      H.aiEq = true;
+      // AI 音量平衡：每台设备在听众位的实际响度（含均衡的预留音量）调到一样大。
+      // 以最小声的那台为准（只往下调，不会爆音）；但最多压 12dB，太小声的那台提醒调大它的系统音量。
+      const meas = rows.filter((r) => r.eq && r.d);
+      const eff = meas.map((r) => r.eq.lvl + r.eq.pre), hi = Math.max(...eff), target = Math.max(Math.min(...eff), hi - 12);
+      this.aiVolUndo = Object.fromEntries(meas.map((r) => [r.d.id, r.d.autoVol ?? null]));
+      const quiet = [];
+      meas.forEach((r, i) => {
+        const want = target - eff[i];
+        r.d.autoVol = Math.round(Math.max(-12, Math.min(3, want)) * 10) / 10;
+        r.vol = r.d.autoVol;
+        if (want > 3.5) quiet.push(r.d.name);
+      });
+      H.aiEq = true; H.aiVol = true;
       out(`✅ AI 校正完成，已自动启用（<span style="color:#ff6b6b">红线</span> = 设备原本的声音，<span style="color:#51cf66">绿线</span> = 校正后，越平直越接近原曲）
-        <table class="small" style="width:100%;margin-top:6px">${rows.map(({ d, eq }) => `<tr><td>${esc(d?.name || '?')}</td><td>${eq ? this.eqSvg(eq) : '<span style="color:var(--bad)">没听清，未校正</span>'}</td><td class="muted">${eq ? this.eqSummary(eq) : ''}</td></tr>`).join('')}</table>`);
+        <table class="small" style="width:100%;margin-top:6px">${rows.map(({ d, eq, vol }) => `<tr><td>${esc(d?.name || '?')}</td><td>${eq ? this.eqSvg(eq) : '<span style="color:var(--bad)">没听清，未校正</span>'}</td><td class="muted">${eq ? this.eqSummary(eq) : ''}${vol !== undefined ? `<div>🔊 音量 ${Math.abs(vol) < 0.5 ? '不用调' : (vol > 0 ? '调大 ' : '调小 ') + Math.abs(vol).toFixed(1) + ' dB'}</div>` : ''}</td></tr>`).join('')}</table>
+        ${quiet.length ? `<div style="color:var(--warn,#f59f00);margin-top:4px">⚠️ ${quiet.map(esc).join('、')} 太小声了，App 里已经调到最大也追不上：请把它的<b>系统音量</b>（手机侧边的音量键）调大，再按一次 AI 校正。</div>` : ''}`);
       $('#aiUndo').hidden = false;
       this.changed();
     } catch (e) {
@@ -937,72 +953,87 @@ const host = {
     return [ups.length ? `补强 ${ups.join('、')}` : '', downs.length ? `压低 ${downs.join('、')}` : ''].filter(Boolean).join('；') || '本身就很平衡';
   },
 
-  async calibrate() {
-    if (this.calibrating) return;
-    const out = (h) => ($('#calibOut').innerHTML = h);
-    const micId = $('#calibMic').value;
-    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
-    if (!devs.length) return toast('还没有在线的播放设备');
-    const client = micId === 'self' ? null : [...this.link?.clients.values() || []].find((c) => c.did === micId);
-    if (micId !== 'self' && !client) return toast('选的录音设备不在线');
-    this.calibrating = true; $('#calibBtn').disabled = true;
+  // 让每台设备轮流“啾”rounds 轮，返回每台设备相对“应有时刻”的误差（毫秒）
+  async measureChirps(devs, micId, rounds, out, label) {
     let recorder = null;
     try {
-      // 1) 先打开麦克风（第一次会弹出权限询问）
-      out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
+      let client = null;
       if (micId === 'self') {
         const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
-        recorder = new MicRecorder(ctx, hostNow);
-        await recorder.start();
-      } else {
-        this.link.send(client, { t: 'micPrep' });
-        const r = await this.waitFor(micId, 30000);
-        if (!r || r.t !== 'micReady') throw new Error(r?.msg ? '录音设备无法使用麦克风：' + r.msg : '录音设备没有回应（请在那台手机上允许麦克风）');
-      }
-      // 2) 安排每台设备轮流“啾”3 轮
-      const gap = 900, rounds = 3, n = devs.length, T0 = hostNow() + 1200;
+        recorder = new MicRecorder(ctx, hostNow); await recorder.start();
+      } else ({ client } = await this.openMic(micId));
+      const gap = 650, n = devs.length, T0 = hostNow() + 1200;
       const slots = [];
       for (let r = 0; r < rounds; r++) devs.forEach((d, i) => slots.push({ did: d.id, at: T0 + (r * n + i) * gap }));
+      const until = slots[slots.length - 1].at + 1200;
       for (const d of devs) {
         const at = slots.filter((x) => x.did === d.id).map((x) => x.at);
-        if (d.id === 'self') { this.selfEngine.duck(at[at.length - 1] + 1200); at.forEach((t) => this.selfEngine.playChirpAt(t)); }
-        else for (const c of this.link.clients.values()) if (c.did === d.id) this.link.send(c, { t: 'chirp', at, until: slots[slots.length - 1].at + 1200 });
+        if (d.id === 'self') { this.selfEngine.duck(until); at.forEach((t) => this.selfEngine.playChirpAt(t)); }
+        else for (const c of this.link.clients.values()) if (c.did === d.id) this.link.send(c, { t: 'chirp', at, until });
       }
-      const end = slots[slots.length - 1].at + 900;
-      out(`🔊 校准中，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
+      const end = slots[slots.length - 1].at + 800;
+      out(`🔊 ${label}，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
       let results;
       if (recorder) {
-        await sleep(end - hostNow());
-        out('🧮 分析录音中…');
-        await sleep(30);
-        results = detectChirps(recorder.stop(), slots);
-        recorder = null;
+        await sleep(end - hostNow()); await sleep(30);
+        results = detectChirps(recorder.stop(), slots); recorder = null;
       } else {
         this.link.send(client, { t: 'measure', end, slots });
         const r = await this.waitFor(micId, end - hostNow() + 20000);
         if (!r || r.t !== 'measureResult') throw new Error('录音设备没有返回结果');
         results = r.results;
       }
-      // 3) 计算每台设备的偏差（取中位数），以所有设备的中位数为基准对齐
-      const rows = devs.map((d) => {
-        const ok = results.filter((x) => x.did === d.id && x.ok).map((x) => x.err);
-        // 3 次结果要互相吻合（相差 15ms 以内）才算数，防止把别的声音误认成“啾”
-        const med = ok.length >= 2 ? median(ok) : null;
-        const agree = ok.filter((e) => med !== null && Math.abs(e - med) < 15).length;
-        return { d, n: agree, med: agree >= 2 ? med : null };
+      return devs.map((d) => {
+        const v = results.filter((x) => x.did === d.id && x.ok).map((x) => x.err);
+        const med = median(v), agree = v.filter((e) => med !== null && Math.abs(e - med) < 2);
+        const ok = agree.length >= Math.ceil(rounds / 2);
+        return { d, n: agree.length, of: rounds, val: ok ? robustMean(agree) : null, spread: ok && agree.length > 1 ? Math.max(...agree) - Math.min(...agree) : null };
       });
-      const valid = rows.filter((r) => r.med !== null);
+    } finally {
+      if (recorder) try { recorder.stop(); } catch {}
+    }
+  },
+
+  async calibrate() {
+    if (this.calibrating) return;
+    const out = (h) => ($('#calibOut').innerHTML = h);
+    const micId = $('#calibMic').value;
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (!devs.length) return toast('还没有在线的播放设备');
+    if (micId !== 'self' && ![...this.link?.clients.values() || []].some((c) => c.did === micId)) return toast('选的录音设备不在线');
+    this.calibrating = true; $('#calibBtn').disabled = true;
+    const r1 = (v) => Math.round(v * 10) / 10;
+    try {
+      out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
+      // 第 1 步：每台设备“啾”5 轮，算出各自快/慢多少
+      const rows = await this.measureChirps(devs, micId, 5, out, '第 1 步：测量各设备的延迟');
+      const valid = rows.filter((r) => r.val !== null);
       if (!valid.length) throw new Error('没有录到清楚的“啾”声：把录音设备放近一点、把音量调大、保持安静再试');
-      const ref = median(valid.map((r) => r.med));
+      const ref = median(valid.map((r) => r.val));
       this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
-      for (const r of valid) r.d.latencyMs = Math.max(-1000, Math.min(1000, Math.round(r.d.latencyMs - (r.med - ref))));
-      out(`✅ 校准完成（每台设备取 3 次中位数）：<table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td><td>${r.med === null ? `<span style="color:var(--bad)">没听清（${r.n}/3）</span>` : `${r.med - ref > 0 ? '晚' : '早'} ${Math.abs(r.med - ref).toFixed(0)} ms`}</td><td>${r.med === null ? '未调整' : `微调 → ${r.d.latencyMs} ms`}</td></tr>`).join('')}</table>`);
+      for (const r of valid) { r.first = r.val - ref; r.d.latencyMs = Math.max(-1000, Math.min(1000, r1(r.d.latencyMs - r.first))); }
+      this.changed(); this.lastWire = ''; this.publish();
+      await sleep(1500); // 等新设置传到每台设备
+      // 第 2 步：再测 3 轮验证；还有超过 0.3ms 的偏差就再修正一次
+      const check = await this.measureChirps(valid.map((r) => r.d), micId, 3, out, '第 2 步：验证校准结果');
+      const cv = check.filter((r) => r.val !== null), ref2 = cv.length ? median(cv.map((r) => r.val)) : 0;
+      for (const c of cv) {
+        const row = rows.find((r) => r.d === c.d);
+        row.resid = c.val - ref2;
+        if (Math.abs(row.resid) > 0.3) { c.d.latencyMs = Math.max(-1000, Math.min(1000, r1(c.d.latencyMs - row.resid))); row.fixed = true; }
+      }
+      const verified = rows.filter((r) => r.resid !== undefined && !r.fixed), nFixed = rows.filter((r) => r.fixed).length;
+      const worst = Math.max(0, ...verified.map((r) => Math.abs(r.resid)));
+      out(`✅ 校准完成：${verified.length ? `验证结果各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>（声音 1ms 只走 34cm，已经听不出先后）` : ''}${nFixed ? `；${nFixed} 台验证时还差一点，已自动再修正（想确认可以再按一次校准）` : ''}
+        <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td>
+          <td>${r.val === null ? `<span style="color:var(--bad)">没听清（${r.n}/5）</span>` : `原本${r.first > 0 ? '晚' : '早'} ${Math.abs(r.first).toFixed(1)} ms`}</td>
+          <td>${r.resid === undefined ? (r.val === null ? '未调整' : '验证没听清') : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms${r.fixed ? '（已再修正）' : ''}`}</td>
+          <td class="muted">微调 → ${r.d.latencyMs} ms</td></tr>`).join('')}</table>`);
       $('#calibUndo').hidden = false;
       this.changed();
     } catch (e) {
       out('❌ ' + esc(e.message || String(e)));
     } finally {
-      if (recorder) try { recorder.stop(); } catch {}
       this.calibrating = false; $('#calibBtn').disabled = false;
     }
   },
@@ -1129,6 +1160,7 @@ const host = {
     if (document.activeElement !== $('#liveDelay')) $('#liveDelay').value = H.liveDelay;
     $('#liveDelayVal').textContent = `${H.liveDelay} ms`;
     $('#aiEq').checked = H.aiEq !== false;
+    $('#aiVol').checked = H.aiVol !== false;
     $('#quality').value = H.quality || (H.opus ? 'high' : 'lossless');
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
@@ -1442,20 +1474,46 @@ function decodeWire(w, did) {
 //                              播放节点
 // =====================================================================
 class Clock {
+  // 时钟同步：用往返最快的那些 ping 估算“控制端时钟 - 本机时钟”的差值。
+  // 另外估算两边时钟走快/走慢的速度（漂移），提前补偿——几分钟一次的小误差也不会累积。
   constructor() { this.reset(); }
-  reset() { this.samples = []; this.offset = null; this.rtt = null; this.jitter = null; }
+  reset() { this.samples = []; this.offset = null; this.rtt = null; this.jitter = null; this.model = null; this.skew = 0; }
   get synced() { return this.offset !== null && this.samples.length >= 3; }
-  now() { return performance.now() + (this.offset ?? 0); }
-  add(c, s) {
-    const t1 = performance.now(), rtt = t1 - c;
+  offsetAt(t) { return this.model ? this.model.a + this.model.b * (t - this.model.t) : (this.offset ?? 0); }
+  now() { const t = performance.now(); return t + this.offsetAt(t); }
+  add(c, s, t1 = performance.now()) {
+    const rtt = t1 - c;
     if (rtt < 0 || rtt > 5000) return;
     this.samples.push({ rtt, offset: s + rtt / 2 - t1, at: t1 });
-    this.samples = this.samples.filter((x) => t1 - x.at < 90000).slice(-40);
-    const best = [...this.samples].sort((a, b) => a.rtt - b.rtt).slice(0, Math.max(1, Math.ceil(this.samples.length / 3)));
-    const est = best.reduce((a, b) => a + b.offset, 0) / best.length;
-    this.jitter = best.length > 1 ? Math.max(...best.map((b) => b.offset)) - Math.min(...best.map((b) => b.offset)) : null;
-    this.rtt = best[0].rtt;
-    this.offset = this.offset === null || Math.abs(est - this.offset) > 40 ? est : this.offset + (est - this.offset) * 0.3;
+    this.samples = this.samples.filter((x) => t1 - x.at < 300000).slice(-500);
+    // 每 4 秒一组，只取这组里往返最快的一次（最快的那次网络排队最少，最准）
+    const buckets = new Map();
+    for (const x of this.samples) { const k = Math.floor(x.at / 4000), b = buckets.get(k); if (!b || x.rtt < b.rtt) buckets.set(k, x); }
+    let pts = [...buckets.values()].sort((a, b) => a.at - b.at);
+    const minR = Math.min(...pts.map((p) => p.rtt));
+    pts = pts.filter((p) => p.rtt <= minR * 1.6 + 4); // 网络特别堵的那几组不用
+    this.rtt = minR;
+    const recent = [...this.samples].sort((a, b) => a.rtt - b.rtt).slice(0, Math.max(1, Math.ceil(Math.min(this.samples.length, 15) / 3)));
+    const simple = recent.reduce((a, b) => a + b.offset, 0) / recent.length;
+    let model;
+    if (pts.length >= 6 && pts[pts.length - 1].at - pts[0].at > 40000) {
+      // 直线拟合：offset = a + b × 时间（b 就是两边时钟的快慢差）
+      const tr = pts[pts.length - 1].at, n = pts.length;
+      const mx = pts.reduce((a, p) => a + (p.at - tr), 0) / n, my = pts.reduce((a, p) => a + p.offset, 0) / n;
+      let sxx = 0, sxy = 0;
+      for (const p of pts) { sxx += (p.at - tr - mx) ** 2; sxy += (p.at - tr - mx) * (p.offset - my); }
+      const b = Math.max(-3e-4, Math.min(3e-4, sxx ? sxy / sxx : 0));
+      model = { a: my - b * mx, b, t: tr };
+      const res = pts.map((p) => p.offset - (model.a + b * (p.at - tr)));
+      this.jitter = Math.sqrt(res.reduce((a, r) => a + r * r, 0) / n) * 2;
+    } else {
+      model = { a: simple, b: 0, t: t1 };
+      this.jitter = recent.length > 1 ? Math.max(...recent.map((x) => x.offset)) - Math.min(...recent.map((x) => x.offset)) : null;
+    }
+    // 新估算和现在用的差太多（比如重新连线）就直接换；差一点点就平滑过渡，避免声音跳一下
+    const cur = this.model ? this.offsetAt(t1) : null, next = model.a + model.b * (t1 - model.t);
+    if (cur !== null && Math.abs(next - cur) <= 40) model.a -= (next - cur) * 0.5;
+    this.model = model; this.skew = model.b; this.offset = this.offsetAt(t1);
   }
 }
 
@@ -1489,7 +1547,7 @@ const node = {
     });
     this.link.addEventListener('msg', (e) => this.onMsg(e.detail));
     this.link.addEventListener('bin', (e) => this.onBin(e.detail));
-    setInterval(() => this.burst(5), 10000);
+    setInterval(() => this.burst(4), 4000); // 更密的对时：每 4 秒 4 个 ping（流量很小）
     setInterval(() => this.sendStats(), 2000);
     setInterval(() => this.render(), 500);
     setInterval(() => this.renderLyrics(), 150);
@@ -1662,7 +1720,7 @@ const node = {
     const li = e.loadInfo, n = (v, d = 0) => (v === null || v === undefined ? '—' : v.toFixed(d));
     const dl = this.dlPercent();
     const rows = [
-      ['时钟同步', this.clock.synced ? `往返 ${n(this.clock.rtt, 1)} ms · 抖动 ${n(this.clock.jitter, 1)} ms` : this.link?.connected ? '同步中…' : '等待连接'],
+      ['时钟同步', this.clock.synced ? `往返 ${n(this.clock.rtt, 1)} ms · 抖动 ${n(this.clock.jitter, 1)} ms · 时钟快慢差 ${n(this.clock.skew * 1e6, 0)} ppm` : this.link?.connected ? '同步中…' : '等待连接'],
       isLive
         ? ['实时音频', `收到 ${e.liveStats.got} 段 · 迟到丢弃 ${e.liveStats.late} · 重新对齐 ${e.liveStats.resyncs} 次`]
         : ['音频加载', li.needed === 0 ? '—' : li.loaded === li.needed ? '✅ 已就绪' : dl !== null ? `从控制端下载中 ${dl}%` : `解码中 ${li.loaded}/${li.needed}`],
