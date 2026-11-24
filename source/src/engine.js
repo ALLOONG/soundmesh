@@ -1,5 +1,6 @@
 // 播放引擎：解码/合成音频、把“控制端时钟”换算成 AudioContext 时间、精确调度、漂移修正
 import { synthBuffer } from './synth.js';
+import { makeSweep, EQ_FREQS, EQ_Q } from './calib.js';
 import { makeChirp } from './calib.js';
 
 const DRIFT_LIMIT_MS = 35;
@@ -29,7 +30,13 @@ export class Engine extends EventTarget {
     this.hushGain = this.ctx.createGain(); // 暂停检测：音源一暂停就立刻静音
     this.deviceGain.connect(this.motionGain);
     this.motionGain.connect(this.hushGain);
-    this.hushGain.connect(this.master);
+    // AI 音色校正：10 段均衡（平时增益都是 0，完全不影响声音）
+    this.eq = EQ_FREQS.map((f) => { const b = this.ctx.createBiquadFilter(); b.type = 'peaking'; b.frequency.value = f; b.Q.value = EQ_Q; b.gain.value = 0; return b; });
+    this.eqPre = this.ctx.createGain();
+    this.hushGain.connect(this.eq[0]);
+    for (let i = 1; i < this.eq.length; i++) this.eq[i - 1].connect(this.eq[i]);
+    this.eq[this.eq.length - 1].connect(this.eqPre);
+    this.eqPre.connect(this.master);
     this.motionTimer = setInterval(() => this.tickMotion(), 40);
     this.unlocked = false;
     this.buffers = new Map(); // src -> { promise, buffer, error }
@@ -222,7 +229,30 @@ export class Engine extends EventTarget {
   }
 
   // ---------- 核心 ----------
-  update(cur) { this.cur = cur; this.apply(); }
+  update(cur) { this.cur = cur; this.setEq(cur?.plan?.eq || null); this.apply(); }
+  // eq: [前置音量 dB, 10 段增益 dB...] 或 null（关闭）
+  setEq(eq) {
+    const key = eq ? eq.join(',') : '';
+    if (key === this.eqKey) return;
+    this.eqKey = key;
+    const t = this.ctx.currentTime;
+    this.eq.forEach((b, i) => b.gain.setTargetAtTime(eq ? eq[i + 1] || 0 : 0, t, 0.08));
+    this.eqPre.gain.setTargetAtTime(eq ? 10 ** ((eq[0] || 0) / 20) : 1, t, 0.08);
+  }
+  // 测量用扫频：不经过均衡器（测的是设备本身的声音）
+  playSweepAt(at) {
+    if (!this.unlocked) return false;
+    if (!this.sweepBuf) {
+      const c = makeSweep(this.ctx.sampleRate);
+      this.sweepBuf = this.ctx.createBuffer(1, c.length, this.ctx.sampleRate);
+      this.sweepBuf.copyToChannel(c, 0);
+    }
+    const when = this.clockToCtx(at);
+    if (when < this.ctx.currentTime + 0.01) return false;
+    const s = this.ctx.createBufferSource();
+    s.buffer = this.sweepBuf; s.connect(this.master); s.start(when);
+    return true;
+  }
 
   apply() {
     const cur = this.cur;
@@ -365,10 +395,11 @@ export class Engine extends EventTarget {
       when = Math.max(expected, now + 0.005);
       this.liveStats.resyncs++;
     } else {
-      // 紧接上一段播放（无缝），并用极小的变速慢慢追平时钟误差（最多 0.3%，听不出来）
+      // 紧接上一段播放（无缝）。误差 2ms 以内完全不变速（音高 100% 原样）；
+      // 平时只用 ±0.07% 慢慢追（约 1 音分，人耳听不出）；只有缓冲刚调整、误差超过 15ms 时才用到 ±0.3%
       when = cursor;
-      const err = cursor - expected;
-      rate = 1 + Math.max(-0.003, Math.min(0.003, err * 2));
+      const err = cursor - expected, lim = Math.abs(err) > 0.015 ? 0.003 : 0.0007;
+      rate = Math.abs(err) < 0.002 ? 1 : 1 + Math.max(-lim, Math.min(lim, err * 2));
     }
     const src = this.ctx.createBufferSource();
     src.buffer = buffer;

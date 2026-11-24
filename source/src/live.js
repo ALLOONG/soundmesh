@@ -207,14 +207,18 @@ export class LiveCapture extends EventTarget {
 
 // PCM 打包：Float32 各声道 -> Int16 交错
 export function pcmEncode(planes) {
+  // 加一点三角抖动（TPDF dither）：小声的段落不会因为转 16 位而产生“沙沙”的失真
   const ch = planes.length, n = planes[0].length, out = new Int16Array(n * ch);
-  for (let i = 0; i < n; i++) for (let c = 0; c < ch; c++) out[i * ch + c] = Math.max(-1, Math.min(1, planes[c][i])) * 32767;
+  for (let i = 0; i < n; i++) for (let c = 0; c < ch; c++) {
+    const v = Math.max(-1, Math.min(1, planes[c][i])) * 32767 + (Math.random() - Math.random());
+    out[i * ch + c] = Math.max(-32768, Math.min(32767, Math.round(v)));
+  }
   return out;
 }
 
 // 一路音频（完整混音或某个声部）的 Opus 编码器
 export class StreamEncoder {
-  constructor(channels, onChunk) {
+  constructor(channels, onChunk, quality = 'high') {
     this.channels = channels; this.ok = false;
     // 每送进去 20ms 就出来一包；时间戳按送进去的顺序对应，不用编码器自己算的（它会忽略中间的停顿）
     this.q = [];
@@ -228,7 +232,10 @@ export class StreamEncoder {
         },
         error: () => { this.ok = false; },
       });
-      this.enc.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: channels, bitrate: channels === 2 ? 160000 : 96000 });
+      // 高音质：320kbps 立体声（Opus 最高档，听感接近原声）；标准：160kbps
+      const bitrate = quality === 'standard' ? (channels === 2 ? 160000 : 96000) : (channels === 2 ? 320000 : 192000);
+      const cfg = { codec: 'opus', sampleRate: SR, numberOfChannels: channels, bitrate };
+      try { this.enc.configure({ ...cfg, opus: { complexity: 10, frameDuration: 20000 } }); } catch { this.enc.configure(cfg); }
       this.ok = true;
     } catch { this.ok = false; }
   }
