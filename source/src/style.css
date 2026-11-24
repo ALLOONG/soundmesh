@@ -65,7 +65,9 @@ label { display: inline-flex; align-items: center; gap: 6px; }
 .host .stage { position: relative; padding: 14px; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
 .host aside { border-left: 1px solid var(--line); overflow-y: auto; padding: 14px; }
 .host aside > section + section { margin-top: 14px; }
-#canvas { width: 100%; flex: 1; min-height: 0; touch-action: none; user-select: none; display: block; }
+/* 空白处可以照常上下滑动页面；按住设备/听众位才是拖动 */
+#canvas { width: 100%; flex: 1; min-height: 0; touch-action: pan-y; user-select: none; display: block; }
+#canvas [data-drag] { touch-action: none; }
 #canvas .grid line { stroke: #222733; stroke-width: 1; }
 #canvas .room { fill: #12151b; stroke: #353b48; stroke-width: 2; }
 #canvas .dev { cursor: grab; }
@@ -103,8 +105,11 @@ label { display: inline-flex; align-items: center; gap: 6px; }
 .seg button.on { background: var(--accent); color: #fff; }
 .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #2a3040; padding: 8px 14px; border-radius: 8px; font-size: 13px; z-index: 9; }
 
+#joinUrl { word-break: break-all; min-width: 0; }
+.host > * { min-width: 0; }
 @media (max-width: 900px) {
-  .host { grid-template-columns: 1fr; grid-template-rows: auto 55vh auto; height: auto; }
+  html, body { overflow-x: hidden; }
+  .host { grid-template-columns: 1fr; grid-template-rows: auto 55vh auto; height: auto; max-width: 100vw; overflow-x: hidden; }
   .host aside { border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
 }
 

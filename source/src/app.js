@@ -1023,26 +1023,41 @@ const host = {
       if (!g) return;
       const p = pt(e), obj = g.dataset.drag === 'listener' ? H.listener : H.devices[g.dataset.id];
       if (!obj) return;
-      this.drag = { obj, dx: obj.x * 100 - p.x, dy: obj.y * 100 - p.y };
+      this.drag = { obj, dx: obj.x * 100 - p.x, dy: obj.y * 100 - p.y, id: g.dataset.drag === 'dev' ? g.dataset.id : null, x0: e.clientX, y0: e.clientY, moved: false };
       svg.setPointerCapture(e.pointerId);
-      if (g.dataset.drag === 'dev') this.select(g.dataset.id);
+      // 选中设备，但拖动时不滚动页面（以前会把页面/右栏滚到设备卡片，手机上整页跳走）
+      if (this.drag.id) { this.selected = this.drag.id; this.renderSoon(); }
       e.preventDefault();
     });
     svg.addEventListener('pointermove', (e) => {
-      if (!this.drag) return;
+      const d = this.drag;
+      if (!d) return;
+      e.preventDefault();
+      if (Math.hypot(e.clientX - d.x0, e.clientY - d.y0) > 3) d.moved = true;
       const p = pt(e);
-      this.drag.obj.x = Math.min(H.size.w, Math.max(0, (p.x + this.drag.dx) / 100));
-      this.drag.obj.y = Math.min(H.size.h, Math.max(0, (p.y + this.drag.dy) / 100));
-      this.changed();
-    });
-    const end = () => (this.drag = null);
+      d.obj.x = Math.min(H.size.w, Math.max(0, (p.x + d.dx) / 100));
+      d.obj.y = Math.min(H.size.h, Math.max(0, (p.y + d.dy) / 100));
+      // 拖动中只重画画布（每帧一次），设备那边每 80ms 更新一次；放手后再刷新整页
+      if (!this.dragFrame) this.dragFrame = requestAnimationFrame(() => { this.dragFrame = null; this.renderCanvas(this.plans()); });
+      if (!this.pubTimer) this.pubTimer = setTimeout(() => { this.pubTimer = null; this.publish(); }, 80);
+    }, { passive: false });
+    const end = () => {
+      const d = this.drag;
+      if (!d) return;
+      this.drag = null;
+      if (d.moved) this.changed();
+      // 只是点一下（没拖）：电脑上把右栏滚到这台设备的设置（不动整页）
+      else if (d.id) {
+        this.select(d.id, matchMedia('(min-width: 901px)').matches);
+      }
+    };
     svg.addEventListener('pointerup', end);
     svg.addEventListener('pointercancel', end);
   },
-  select(id) {
+  select(id, scroll = true) {
     this.selected = id;
     this.render();
-    this.cards.get(id)?.root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    if (scroll) this.cards.get(id)?.root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   },
 
   render() {
