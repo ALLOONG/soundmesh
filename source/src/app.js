@@ -329,6 +329,8 @@ const host = {
         this.changed();
       }
       this.renderSoon();
+    } else if (msg.t === 'chirpAck' && c.did) {
+      (this.chirpAcks ||= {})[c.did] = msg;
     } else if (msg.t === 'self' && H.devices[c.did]) {
       const d = H.devices[c.did];
       if (typeof msg.name === 'string' && msg.name.trim()) d.name = msg.name.trim().slice(0, 24);
@@ -485,12 +487,16 @@ const host = {
   },
   // 画面延迟 = 缓冲延迟 + 各设备平均位置延迟 + 手动微调
   mirrorDelay() {
-    const plans = Object.values(this.plans());
+    const pcOut = ((this.selfEngine?.ctx || this.calCtx)?.outputLatency || 0) * 1000;
+    // 校准过：每台设备“排定的延迟 + 实测的真实延迟”就是它真正出声的时刻（校准后各设备都一样），取中间值
+    const pm = this.plans(), arrive = Object.values(H.devices).filter((d) => d.online && Number.isFinite(d.realLat) && pm[d.id])
+      .map((d) => (pm[d.id].delayMs || 0) + (d.latencyMs || 0) + d.realLat);
+    if (arrive.length) return Math.max(0, H.liveDelay + median(arrive) - pcOut + (H.mirrorOffset || 0));
+    const plans = Object.values(pm);
     const avgD = plans.length ? plans.reduce((a, p) => a + p.delayMs, 0) / plans.length : 0;
     const avgLat = Object.values(H.devices).filter((d) => d.online).reduce((a, d, _, arr) => a + d.latencyMs / arr.length, 0);
     // 校准测到的“真实到达比预定晚多少”，再减去电脑本身播放 YouTube 时的输出延迟（YouTube 画面是按那个时间对齐的）
     const real = Number.isFinite(H.avBase) ? H.avBase : 0;
-    const pcOut = ((this.selfEngine?.ctx || this.calCtx)?.outputLatency || 0) * 1000;
     return Math.max(0, H.liveDelay + avgD + avgLat + real - pcOut + (H.mirrorOffset || 0));
   },
   toggleMirror(on) {
@@ -911,7 +917,8 @@ const host = {
   },
 
   // 让每台设备轮流“啾”rounds 轮，返回每台设备相对“应有时刻”的误差（毫秒）
-  async measureChirps(devs, micId, rounds, out, label) {
+  async measureChirps(devs, micId, rounds, out, label, raw = false) {
+    this.chirpAcks ||= {};
     let recorder = null;
     try {
       let client = null;
@@ -919,14 +926,14 @@ const host = {
         const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
         recorder = new MicRecorder(ctx, hostNow); await recorder.start();
       } else ({ client } = await this.openMic(micId));
-      const gap = 650, n = devs.length, T0 = hostNow() + 1200;
+      const gap = 800, n = devs.length, T0 = hostNow() + 1200;
       const slots = [];
       for (let r = 0; r < rounds; r++) devs.forEach((d, i) => slots.push({ did: d.id, at: T0 + (r * n + i) * gap }));
       const until = slots[slots.length - 1].at + 1200;
       for (const d of devs) {
         const at = slots.filter((x) => x.did === d.id).map((x) => x.at);
-        if (d.id === 'self') { this.selfEngine.duck(until); at.forEach((t) => this.selfEngine.playChirpAt(t)); }
-        else for (const c of this.link.clients.values()) if (c.did === d.id) this.link.send(c, { t: 'chirp', at, until });
+        if (d.id === 'self') { this.selfEngine.duck(until); this.chirpAcks.self = { played: at.filter((t) => this.selfEngine.playChirpAt(t, raw)).length, total: at.length }; }
+        else for (const c of this.link.clients.values()) if (c.did === d.id) this.link.send(c, { t: 'chirp', at, until, raw });
       }
       const end = slots[slots.length - 1].at + 800;
       out(`🔊 ${label}，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
@@ -951,6 +958,16 @@ const host = {
     }
   },
 
+  // 某台设备“没听清”的原因
+  chirpWhy(d) {
+    const a = this.chirpAcks?.[d.id];
+    if (!a) return '没有回应：这台设备可能断线了，或者还是旧版本（请刷新它的页面）';
+    if (!a.unlocked || a.state !== 'running') return '它的声音被系统暂停了：在那台设备上点一下屏幕，确认有“正在出声”，再校准';
+    if (a.hidden) return '它的 SoundMesh 在后台：切回前台、亮着屏幕再校准';
+    if (a.played < a.total) return `测试音只播出 ${a.played}/${a.total} 次：那台设备可能太忙或时间还没对准，过几秒再试`;
+    return '测试音播了，但录音设备没听清：把它的系统音量调大一点、或把录音设备放近一点、周围安静一点';
+  },
+
   async calibrate() {
     if (this.calibrating) return;
     const out = (h) => ($('#calibOut').innerHTML = h);
@@ -962,13 +979,20 @@ const host = {
     const r1 = (v) => Math.round(v * 10) / 10;
     try {
       out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
-      // 第 1 步：每台设备“啾”5 轮，算出各自快/慢多少
-      const rows = await this.measureChirps(devs, micId, 5, out, '第 1 步：测量各设备的延迟');
-      const valid = rows.filter((r) => r.val !== null);
+      this.chirpAcks = {};
+      const hiddenDevs = devs.filter((d) => d.id !== 'self' && d.stats?.hidden);
+      if (hiddenDevs.length) toast(`⚠️ ${hiddenDevs.map((d) => d.name).join('、')} 的 SoundMesh 在后台，可能播不出测试音：请把它切回前台、亮着屏幕`);
+      // 第 1 步：每台设备“啾”5 轮。不套用以前的延迟微调，直接量出每台设备真实的延迟
+      const rows = await this.measureChirps(devs, micId, 5, out, '第 1 步：测量各设备真实的延迟', true);
+      const plans0 = this.plans();
+      for (const r of rows) r.e = r.val === null ? null : r.val - (plans0[r.d.id]?.delayMs || 0); // 扣掉按位置故意加的延迟
+      const valid = rows.filter((r) => r.e !== null);
       if (!valid.length) throw new Error('没有录到清楚的“啾”声：把录音设备放近一点、把音量调大、保持安静再试');
-      const ref = median(valid.map((r) => r.val));
+      // 以最慢的那台为准：其他设备等它（延迟微调都是 0 或正数）。这样没有设备需要“提前播”，缓冲可以压到最低
+      const slowest = Math.max(...valid.map((r) => r.e));
       this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
-      for (const r of valid) { r.first = r.val - ref; r.d.latencyMs = Math.max(-1000, Math.min(1000, r1(r.d.latencyMs - r.first))); }
+      for (const r of valid) { r.first = r.e; r.d.latencyMs = Math.max(0, Math.min(1000, r1(slowest - r.e))); }
+      const ref = 0;
       this.changed(); this.lastWire = ''; this.publish();
       await sleep(1500); // 等新设置传到每台设备
       // 第 2 步：再测 3 轮验证；还有超过 0.3ms 的偏差就再修正一次
@@ -979,19 +1003,23 @@ const host = {
       const plansNow = this.plans(), Dof = (d) => (plansNow[d.id]?.delayMs || 0) + (d.latencyMs || 0);
       const eList = cv.length ? cv.map((c) => c.val - Dof(c.d)) : [];
       if (eList.length) { H.avBase = Math.round(median(eList) * 10) / 10; H.avCalAt = Date.now(); }
+      for (const c of cv) c.d.realLat = r1(c.val - Dof(c.d)); // 每台设备实测的真实延迟（看视频时算画面要延后多少）
       for (const c of cv) {
         const row = rows.find((r) => r.d === c.d);
         row.resid = c.val - ref2;
         if (Math.abs(row.resid) > 0.3) { c.d.latencyMs = Math.max(-1000, Math.min(1000, r1(c.d.latencyMs - row.resid))); row.fixed = true; }
       }
+      // 再修正后如果有设备变成负数（要提前播），所有设备一起往后挪，保持都 ≥ 0（相对关系不变）
+      const minLat = Math.min(...valid.map((r) => r.d.latencyMs));
+      if (minLat < 0) for (const r of valid) r.d.latencyMs = r1(r.d.latencyMs - minLat);
       const verified = rows.filter((r) => r.resid !== undefined && !r.fixed), nFixed = rows.filter((r) => r.fixed).length;
       const worst = Math.max(0, ...verified.map((r) => Math.abs(r.resid)));
       out(`✅ 校准完成：${verified.length ? `验证结果各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>（声音 1ms 只走 34cm，已经听不出先后）` : ''}${nFixed ? `；${nFixed} 台验证时还差一点，已自动再修正（想确认可以再按一次校准）` : ''}
         <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td>
-          <td>${r.val === null ? `<span style="color:var(--bad)">没听清（${r.n}/5）</span>` : `原本${r.first > 0 ? '晚' : '早'} ${Math.abs(r.first).toFixed(1)} ms`}</td>
+          <td>${r.val === null ? `<span style="color:var(--bad)">没听清（${r.n}/5）</span><div class="muted">${this.chirpWhy(r.d)}</div>` : `比最快的那台慢 ${(r.first - Math.min(...valid.map((v) => v.first))).toFixed(1)} ms`}</td>
           <td>${r.resid === undefined ? (r.val === null ? '未调整' : '验证没听清') : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms${r.fixed ? '（已再修正）' : ''}`}</td>
           <td class="muted">微调 → ${r.d.latencyMs} ms</td></tr>`).join('')}</table>`);
-      if (eList.length) $('#calibOut').insertAdjacentHTML('beforeend', `<div class="muted" style="margin-top:4px">🎬 声音实际到你耳朵比预定${H.avBase >= 0 ? '晚' : '早'} ${Math.abs(H.avBase).toFixed(0)} ms，看视频时画面会自动多延后这么多（YouTube 画面延后扩展 / 全屏同步画面都会用到）</div>`);
+      if (eList.length) $('#calibOut').insertAdjacentHTML('beforeend', `<div class="muted" style="margin-top:4px">🎬 看视频时画面会自动延后到和声音对齐（现在约 ${Math.round(this.mirrorDelay())} ms，已算进各设备喇叭的真实延迟）</div>`);
       $('#calibUndo').hidden = false;
       this.changed();
     } catch (e) {
@@ -1558,7 +1586,9 @@ const node = {
       this.lyrics = m.ly;
     } else if (m.t === 'chirp' && Array.isArray(m.at)) {
       if (m.until) this.engine.duck(m.until);
-      m.at.forEach((t) => this.engine.playChirpAt(t));
+      const played = m.at.filter((t) => this.engine.playChirpAt(t, !!m.raw)).length;
+      // 告诉控制端：测试音有没有真的播出来（没播出来通常是页面在后台/声音被系统暂停）
+      this.link.send({ t: 'chirpAck', played, total: m.at.length, hidden: document.visibilityState !== 'visible', state: this.engine.ctx.state, unlocked: this.engine.unlocked });
     } else if (m.t === 'micPrep') {
       (async () => {
         try {

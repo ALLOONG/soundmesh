@@ -69,7 +69,8 @@ export class MicRecorder {
     this.stream.getTracks().forEach((t) => t.stop());
     const n = this.chunks.reduce((a, c) => a + c.length, 0), rec = new Float32Array(n);
     let o = 0; for (const c of this.chunks) { rec.set(c, o); o += c.length; }
-    return { rec, sr: this.ctx.sampleRate, startHost: this.startHost, inLat: this.inLat || 0 };
+    const res = { rec, sr: this.ctx.sampleRate, startHost: this.startHost, inLat: this.inLat || 0 };
+    return typeof window !== 'undefined' && window.__smFakeMic ? window.__smFakeMic(res) : res; // 自动测试用（平时不存在）
   }
 }
 
@@ -79,7 +80,7 @@ export class MicRecorder {
 // 找最早到达的那个峰（不是墙壁反射回来的），再用抛物线插值精确到不到 1 个采样点（约 0.02ms）
 export function detectChirps({ rec, sr, startHost, inLat = 0 }, slots) {
   const tpl = makeChirp(sr), m = tpl.length;
-  const before = Math.round(0.3 * sr), after = Math.round(0.5 * sr);
+  const before = Math.round(0.3 * sr), after = Math.round(0.6 * sr); // 往后多听一点：蓝牙音箱可能晚 0.5 秒
   let N = 1; while (N < before + after + m * 2) N <<= 1;
   const fft = new FFT(N);
   const tr = new Float64Array(N), ti = new Float64Array(N);

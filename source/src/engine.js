@@ -228,14 +228,15 @@ export class Engine extends EventTarget {
   }
 
   // 校准用：在控制端时间 at（再加本机当前的总延迟，和放音乐时一样）播放一声“啾”
-  playChirpAt(at) {
-    if (!this.unlocked) return false;
+  // raw = true：校准第一步，不套用“延迟微调”（量的是这台设备真实的延迟，不受以前设的数值影响）
+  playChirpAt(at, raw = false) {
+    if (!this.unlocked || this.ctx.state !== 'running') return false;
     if (!this.chirpBuf) {
       const c = makeChirp(this.ctx.sampleRate);
       this.chirpBuf = this.ctx.createBuffer(1, c.length, this.ctx.sampleRate);
       this.chirpBuf.copyToChannel(c, 0);
     }
-    const when = this.clockToCtx(at + (this.cur?.plan?.D || 0));
+    const p = this.cur?.plan, when = this.clockToCtx(at + (raw ? p?.posDelay || 0 : p?.D || 0));
     if (when < this.ctx.currentTime + 0.01) return false;
     const s = this.ctx.createBufferSource(), g = this.ctx.createGain();
     s.buffer = this.chirpBuf; g.gain.value = 0.9;
