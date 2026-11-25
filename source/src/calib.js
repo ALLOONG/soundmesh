@@ -265,7 +265,10 @@ export function alignMusic(mic, windows, getSrc, rate, search) {
     // y[0]（时刻 a）对应原声 xFrom + lag/rate → 听到时刻 - 原声时间
     const offset = w.a - (xFrom + (g.lag / rate) * 1000) - (mic.inLat || 0) * 1000;
     const rms = Math.sqrt(e2 / y.length), quiet = rms < 0.0002; // 约 -74dB：关掉自动增益后耳机麦克风录到的音量本来就小
-    const ok = !quiet && (g.clarity > 8 || (g.clarity > 3.5 && agree));
+    // 一定要前后两半吻合（真的对上时一定一致；单纯的音调、重复的节奏会产生很尖但不一致的“假峰”），
+    // 而且峰不能落在搜索范围的最边缘（那通常是真正的位置在范围外）
+    const edge = g.lag < 2 || g.lag > maxLag - 2;
+    const ok = !quiet && !edge && agree && g.clarity > 3.5;
     return { did: w.did, ok, offset, clarity: g.clarity, agree, levelDb: Math.round(20 * Math.log10(rms + 1e-9)), other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
   });
 }
