@@ -172,3 +172,79 @@ export function analyzeWindows({ rec, sr, startHost }, windows, noiseWin) {
     return { did: w.did, snr, share, cv: f.cv, label };
   });
 }
+
+// ---------- 用正在播的音乐校准 ----------
+// 先轻微低通再换到目标采样率（24kHz：对齐用足够，传输量小一半）
+export function toRate(x, sr, out = 24000) {
+  const f = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) f[i] = 0.25 * (x[i - 1] ?? x[i]) + 0.5 * x[i] + 0.25 * (x[i + 1] ?? x[i]);
+  if (sr === out) return f;
+  const k = sr / out, n = Math.floor((x.length - 1) / k), y = new Float32Array(n);
+  for (let j = 0; j < n; j++) { const p = j * k, i = Math.floor(p), t = p - i; y[j] = f[i] * (1 - t) + f[i + 1] * t; }
+  return y;
+}
+
+// GCC-PHAT：找出 y（录到的）在 x（原声）里的位置。返回最佳位移（可以是小数）和峰值清晰度
+function gccPhat(y, x, maxLag, rate) {
+  let N = 1; while (N < x.length + y.length) N <<= 1;
+  const fft = new FFT(N);
+  const yr = new Float64Array(N), yi = new Float64Array(N), xr = new Float64Array(N), xi = new Float64Array(N);
+  for (let i = 0; i < y.length; i++) yr[i] = y[i];
+  for (let i = 0; i < x.length; i++) xr[i] = x[i];
+  fft.run(yr, yi, false); fft.run(xr, xi, false);
+  const lo = Math.floor((200 / rate) * N), hi = Math.ceil((Math.min(9000, rate * 0.45) / rate) * N);
+  for (let k = 0; k < N; k++) {
+    const kk = k <= N / 2 ? k : N - k;
+    // conj(Y)·X，再只留相位（PHAT）：对音乐这种能量集中在低频的信号，峰会变得很尖
+    const r = yr[k] * xr[k] + yi[k] * xi[k], im = yr[k] * xi[k] - yi[k] * xr[k], m = Math.hypot(r, im);
+    if (kk < lo || kk > hi || m < 1e-12) { yr[k] = 0; yi[k] = 0; } else { yr[k] = r / m; yi[k] = im / m; }
+  }
+  fft.run(yr, yi, true);
+  let best = -Infinity, bi = 0;
+  for (let k = 0; k <= maxLag; k++) if (yr[k] > best) { best = yr[k]; bi = k; }
+  const vals = []; for (let k = 0; k <= maxLag; k++) vals.push(Math.abs(yr[k]));
+  vals.sort((a, b) => a - b);
+  const med = vals[vals.length >> 1] || 1e-12;
+  // 第二高的峰（离最高峰 1ms 以外）：判断有没有别的声音（比如电脑本身在放原声）
+  const guard = Math.round(rate * 0.001);
+  let second = -Infinity, si = -1;
+  for (let k = 0; k <= maxLag; k++) if (Math.abs(k - bi) > guard && yr[k] > second && yr[k] >= (yr[k - 1] ?? -Infinity) && yr[k] >= (yr[k + 1] ?? -Infinity)) { second = yr[k]; si = k; }
+  const y0 = yr[bi - 1] ?? best, y2 = yr[bi + 1] ?? best, den = y0 - 2 * best + y2;
+  const frac = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
+  return { lag: bi + frac, clarity: best / med, second: second > 0 ? second / best : 0, secondLag: si };
+}
+
+// mic: { rec, sr, startHost, inLat }（rec 已经是 rate 采样率）
+// windows: [{ did, a, b, expect }]：a~b 是这台设备单独出声的那段（控制端时间，毫秒），
+//   expect = 预计“原声第 t 毫秒”会在 t + expect 被听到（= 缓冲 + 这台设备的总延迟 + 已知的真实延迟）
+// getSrc(tsFrom, n, rate)：取原声（控制端时间轴）从 tsFrom 开始 n 个采样点
+// 返回每台设备的“实际听到时刻 - 原声时间”（毫秒），以及清晰度和是否有别的声音
+export function alignMusic(mic, windows, getSrc, rate, search) {
+  return windows.map((w) => {
+    const i0 = Math.round(((w.a - mic.startHost) / 1000) * rate), i1 = Math.round(((w.b - mic.startHost) / 1000) * rate);
+    if (i0 < 0 || i1 > mic.rec.length || i1 - i0 < rate * 0.5) return { did: w.did, ok: false };
+    const y = mic.rec.subarray(i0, i1);
+    const S = search; // 往前后各搜索 S 毫秒
+    const xFrom = w.a - w.expect - S, n = (i1 - i0) + Math.round(((2 * S) / 1000) * rate);
+    const x = getSrc(xFrom, n, rate);
+    if (!x) return { did: w.did, ok: false };
+    let e2 = 0; for (const v of y) e2 += v * v;
+    const g = gccPhat(y, x, Math.round(((2 * S) / 1000) * rate), rate);
+    // y[0]（时刻 a）对应原声 xFrom + lag/rate → 听到时刻 - 原声时间
+    const offset = w.a - (xFrom + (g.lag / rate) * 1000) - (mic.inLat || 0) * 1000;
+    const quiet = Math.sqrt(e2 / y.length) < 0.002;
+    return { did: w.did, ok: !quiet && g.clarity > 8, offset, clarity: g.clarity, other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
+  });
+}
+
+// 找“很早就出现的同一份音乐”：比如电脑自己还在放原声（不经过 SoundMesh，所以比所有设备都早）
+// 在 a~b 这段录音里，搜索“原声后 lagFrom~lagTo 毫秒”有没有清楚的相关峰
+export function findEarlyCopy(mic, a, b, lagFrom, lagTo, getSrc, rate) {
+  const i0 = Math.round(((a - mic.startHost) / 1000) * rate), i1 = Math.round(((b - mic.startHost) / 1000) * rate);
+  if (i0 < 0 || i1 > mic.rec.length || i1 - i0 < rate * 0.5 || lagTo <= lagFrom) return null;
+  const y = mic.rec.subarray(i0, i1);
+  const x = getSrc(a - lagTo, (i1 - i0) + Math.round(((lagTo - lagFrom) / 1000) * rate), rate);
+  if (!x) return null;
+  const g = gccPhat(y, x, Math.round(((lagTo - lagFrom) / 1000) * rate), rate);
+  return { found: g.clarity > 10, lagMs: lagTo - (g.lag / rate) * 1000, clarity: g.clarity };
+}

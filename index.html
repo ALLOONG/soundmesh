@@ -309,7 +309,8 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         <div class="small muted">每台设备会轮流发出“啾”声，由一个麦克风在<b>听众位</b>录下来，自动算出每台设备快了还是慢了多少，再填进它的“延迟微调”。蓝牙音箱、不同手机的扬声器延迟都能这样校准。</div>
         <div class="row small"><span>录音设备</span><select id="calibMic" class="grow"></select></div>
         <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
-        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="calibUndo" class="small" hidden>撤销</button></div>
+        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="musicCalBtn" class="primary">🎵 用正在播的音乐校准（更准）</button><button id="calibUndo" class="small" hidden>撤销</button></div>
+        <div class="small muted">“用音乐校准”：先开始共享电脑声音、放一首一直有声音的歌，再按。各设备轮流单独放几秒，直接测音乐真正到你耳朵的时间——测的就是你实际听到的，比“啾”声更准，还能发现电脑自己在放原声这类问题。</div>
         <div id="calibOut" class="small"></div>
         <hr style="border:0;border-top:1px solid var(--line);width:100%">
         <div class="small muted"><b>🔍 分工检查</b>：播放音乐时，各设备轮流单独出声约 2.6 秒，用同一个麦克风录下来，看每台<b>实际</b>放出来的是低音、人声中频、打击还是高频，确认分工有没有生效。</div>
@@ -3366,6 +3367,82 @@ function analyzeWindows({ rec, sr, startHost }, windows, noiseWin) {
   });
 }
 
+// ---------- 用正在播的音乐校准 ----------
+// 先轻微低通再换到目标采样率（24kHz：对齐用足够，传输量小一半）
+function toRate(x, sr, out = 24000) {
+  const f = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) f[i] = 0.25 * (x[i - 1] ?? x[i]) + 0.5 * x[i] + 0.25 * (x[i + 1] ?? x[i]);
+  if (sr === out) return f;
+  const k = sr / out, n = Math.floor((x.length - 1) / k), y = new Float32Array(n);
+  for (let j = 0; j < n; j++) { const p = j * k, i = Math.floor(p), t = p - i; y[j] = f[i] * (1 - t) + f[i + 1] * t; }
+  return y;
+}
+
+// GCC-PHAT：找出 y（录到的）在 x（原声）里的位置。返回最佳位移（可以是小数）和峰值清晰度
+function gccPhat(y, x, maxLag, rate) {
+  let N = 1; while (N < x.length + y.length) N <<= 1;
+  const fft = new FFT(N);
+  const yr = new Float64Array(N), yi = new Float64Array(N), xr = new Float64Array(N), xi = new Float64Array(N);
+  for (let i = 0; i < y.length; i++) yr[i] = y[i];
+  for (let i = 0; i < x.length; i++) xr[i] = x[i];
+  fft.run(yr, yi, false); fft.run(xr, xi, false);
+  const lo = Math.floor((200 / rate) * N), hi = Math.ceil((Math.min(9000, rate * 0.45) / rate) * N);
+  for (let k = 0; k < N; k++) {
+    const kk = k <= N / 2 ? k : N - k;
+    // conj(Y)·X，再只留相位（PHAT）：对音乐这种能量集中在低频的信号，峰会变得很尖
+    const r = yr[k] * xr[k] + yi[k] * xi[k], im = yr[k] * xi[k] - yi[k] * xr[k], m = Math.hypot(r, im);
+    if (kk < lo || kk > hi || m < 1e-12) { yr[k] = 0; yi[k] = 0; } else { yr[k] = r / m; yi[k] = im / m; }
+  }
+  fft.run(yr, yi, true);
+  let best = -Infinity, bi = 0;
+  for (let k = 0; k <= maxLag; k++) if (yr[k] > best) { best = yr[k]; bi = k; }
+  const vals = []; for (let k = 0; k <= maxLag; k++) vals.push(Math.abs(yr[k]));
+  vals.sort((a, b) => a - b);
+  const med = vals[vals.length >> 1] || 1e-12;
+  // 第二高的峰（离最高峰 1ms 以外）：判断有没有别的声音（比如电脑本身在放原声）
+  const guard = Math.round(rate * 0.001);
+  let second = -Infinity, si = -1;
+  for (let k = 0; k <= maxLag; k++) if (Math.abs(k - bi) > guard && yr[k] > second && yr[k] >= (yr[k - 1] ?? -Infinity) && yr[k] >= (yr[k + 1] ?? -Infinity)) { second = yr[k]; si = k; }
+  const y0 = yr[bi - 1] ?? best, y2 = yr[bi + 1] ?? best, den = y0 - 2 * best + y2;
+  const frac = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
+  return { lag: bi + frac, clarity: best / med, second: second > 0 ? second / best : 0, secondLag: si };
+}
+
+// mic: { rec, sr, startHost, inLat }（rec 已经是 rate 采样率）
+// windows: [{ did, a, b, expect }]：a~b 是这台设备单独出声的那段（控制端时间，毫秒），
+//   expect = 预计“原声第 t 毫秒”会在 t + expect 被听到（= 缓冲 + 这台设备的总延迟 + 已知的真实延迟）
+// getSrc(tsFrom, n, rate)：取原声（控制端时间轴）从 tsFrom 开始 n 个采样点
+// 返回每台设备的“实际听到时刻 - 原声时间”（毫秒），以及清晰度和是否有别的声音
+function alignMusic(mic, windows, getSrc, rate, search) {
+  return windows.map((w) => {
+    const i0 = Math.round(((w.a - mic.startHost) / 1000) * rate), i1 = Math.round(((w.b - mic.startHost) / 1000) * rate);
+    if (i0 < 0 || i1 > mic.rec.length || i1 - i0 < rate * 0.5) return { did: w.did, ok: false };
+    const y = mic.rec.subarray(i0, i1);
+    const S = search; // 往前后各搜索 S 毫秒
+    const xFrom = w.a - w.expect - S, n = (i1 - i0) + Math.round(((2 * S) / 1000) * rate);
+    const x = getSrc(xFrom, n, rate);
+    if (!x) return { did: w.did, ok: false };
+    let e2 = 0; for (const v of y) e2 += v * v;
+    const g = gccPhat(y, x, Math.round(((2 * S) / 1000) * rate), rate);
+    // y[0]（时刻 a）对应原声 xFrom + lag/rate → 听到时刻 - 原声时间
+    const offset = w.a - (xFrom + (g.lag / rate) * 1000) - (mic.inLat || 0) * 1000;
+    const quiet = Math.sqrt(e2 / y.length) < 0.002;
+    return { did: w.did, ok: !quiet && g.clarity > 8, offset, clarity: g.clarity, other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
+  });
+}
+
+// 找“很早就出现的同一份音乐”：比如电脑自己还在放原声（不经过 SoundMesh，所以比所有设备都早）
+// 在 a~b 这段录音里，搜索“原声后 lagFrom~lagTo 毫秒”有没有清楚的相关峰
+function findEarlyCopy(mic, a, b, lagFrom, lagTo, getSrc, rate) {
+  const i0 = Math.round(((a - mic.startHost) / 1000) * rate), i1 = Math.round(((b - mic.startHost) / 1000) * rate);
+  if (i0 < 0 || i1 > mic.rec.length || i1 - i0 < rate * 0.5 || lagTo <= lagFrom) return null;
+  const y = mic.rec.subarray(i0, i1);
+  const x = getSrc(a - lagTo, (i1 - i0) + Math.round(((lagTo - lagFrom) / 1000) * rate), rate);
+  if (!x) return null;
+  const g = gccPhat(y, x, Math.round(((lagTo - lagFrom) / 1000) * rate), rate);
+  return { found: g.clarity > 10, lagMs: lagTo - (g.lag / rate) * 1000, clarity: g.clarity };
+}
+
 // ===== separator.js =====
 // 实时拆声部：把立体声实时音频拆成 人声 / 鼓 / 贝斯 / 伴奏 四条单声道
 // 方法（浏览器里能实时跑的简化版，不是 AI 分离）：
@@ -5209,7 +5286,7 @@ const host = {
         dev: Object.values(H.devices).filter((d) => d.online && d.id !== 'self').map((d) => {
           const s = d.stats || {}, c = clients.find((x) => x.did === d.id), pl = this.plans()[d.id];
           return [d.name.slice(0, 8), s.live?.got ?? null, s.live?.late ?? null, s.live?.res ?? s.drifts ?? null, s.rtt ?? null, s.jitter ?? null, s.out ?? null, s.hidden ? 1 : 0, s.via === 'backup' ? 'B' : 'P',
-            pl ? Math.round(pl.D) : null, c ? (this.opusFor(c) ? 'Opus' : 'PCM') : '-', s.live?.concealed ?? 0];
+            pl ? Math.round(this.totalD(d)) : null, c ? (this.opusFor(c) ? 'Opus' : 'PCM') : '-', s.live?.concealed ?? 0];
         }),
       });
       dg.chunks = 0; dg.maxGap = 0; dg.sent = 0; dg.silent = 0; dg.peak = 0;
@@ -5298,6 +5375,7 @@ const host = {
       if (Number.isFinite(msg.latencyMs)) d.latencyMs = Math.max(-1000, Math.min(1000, msg.latencyMs));
       this.changed();
     } else if (msg.t === 'getFile') this.sendFile(c, String(msg.id));
+    else if (msg.t === 'recPart' && c.did) { ((this.recParts ||= {})[c.did] ||= [])[msg.i] = msg.b64; }
     else if (['micReady', 'micErr', 'measureResult'].includes(msg.t) && this.calWait && c.did === this.calWait.did) {
       const w = this.calWait; this.calWait = null; w.resolve(msg);
     }
@@ -5398,6 +5476,9 @@ const host = {
       }
     }
     this.dispatch('live', ts, [l, r]);
+    // 留最近 15 秒的原声（单声道），“用音乐校准”时拿来和录音比对
+    { const m = new Float32Array(l.length); for (let i = 0; i < l.length; i++) m[i] = (l[i] + r[i]) * 0.5;
+      const ring = this.srcRing || (this.srcRing = []); ring.push({ ts, x: m }); while (ring.length && ts - ring[0].ts > 15000) ring.shift(); }
     // 拆声部：只有当有设备需要某个声部时才运行
     if (H.liveStems && STEMS.some((st) => this.anyNeeds('live:' + st))) {
       this.sep = this.sep || new Separator(48000, 960);
@@ -5602,7 +5683,7 @@ const host = {
     let need = 0, needBy = null;
     for (const d of Object.values(H.devices)) {
       if (!d.online || d.id === 'self') continue;
-      const D = plansNow[d.id]?.D ?? ((plansNow[d.id]?.delayMs || 0) + (d.latencyMs || 0));
+      const D = this.totalD(d, plansNow);
       const v = Math.max(0, -D) + (d.stats?.out || 0) + lagMax + (d.stats?.rtt || 10) / 2 + (H.videoMode ? 25 : 60);
       if (v > need) { need = v; needBy = d; }
     }
@@ -5738,6 +5819,7 @@ const host = {
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.calibrate();
+    $('#musicCalBtn').onclick = () => this.musicCalibrate();
     $('#checkBtn').onclick = () => this.checkAssign();
     $('#lySearch').onclick = () => this.lySearch();
     $('#lyQ').onkeydown = (e) => e.key === 'Enter' && this.lySearch();
@@ -5927,6 +6009,127 @@ const host = {
     if (a.hidden) return '它的 SoundMesh 在后台：切回前台、亮着屏幕再校准';
     if (a.played < a.total) return `测试音只播出 ${a.played}/${a.total} 次：那台设备可能太忙或时间还没对准，过几秒再试`;
     return '测试音播了，但录音设备没听清：把它的系统音量调大一点、或把录音设备放近一点、周围安静一点';
+  },
+
+  // 一台设备排定的总延迟（按位置的延迟 + 延迟微调），和设备那边 plan.D 一样
+  totalD(d, pm = this.plans()) { return (pm[d.id]?.delayMs || 0) + (d.latencyMs || 0); },
+
+  // 取原声：控制端时间 tsFrom 开始、rate 采样率下 n 个采样点（缺的地方补 0）
+  srcExcerpt(tsFrom, n, rate) {
+    const ring = this.srcRing || [];
+    if (!ring.length) return null;
+    const durMs = (n / rate) * 1000 + 5, m = Math.ceil((durMs / 1000) * 48000) + 4, out = new Float32Array(m);
+    let any = false;
+    for (const c of ring) {
+      if (c.ts + 20 < tsFrom || c.ts > tsFrom + durMs) continue;
+      const off = Math.round(((c.ts - tsFrom) / 1000) * 48000);
+      for (let i = 0; i < c.x.length; i++) { const j = off + i; if (j >= 0 && j < m) { out[j] = c.x[i]; any = true; } }
+    }
+    if (!any) return null;
+    return toRate(out, 48000, rate).subarray(0, n);
+  },
+
+  // 一轮“用音乐测量”：各设备轮流单独出声，录音后和原声比对，返回每台设备“听到时刻 - 原声时间 - 缓冲”（毫秒）
+  async musicPass(devs, micId, search, out, label) {
+    const rate = 24000, pm = this.plans();
+    const known = (d) => (Number.isFinite(d.realLat) ? d.realLat : 0);
+    const mic = await this.openMic(micId); // 先把麦克风打开（手机可能要一两秒），再安排各设备的出声时段
+    const LEN = 1900, GAP = 350, T0 = hostNow() + 1000;
+    const wins = devs.map((d, i) => {
+      const from = T0 + i * (LEN + GAP), to = from + LEN, k = known(d);
+      return { d, did: d.id, from, to, a: from + k + 300, b: to + k - 60, expect: H.liveDelay + this.totalD(d, pm) + k };
+    });
+    // 最后 1.6 秒所有设备都静音：这时如果还录到同一首歌，就一定不是 SoundMesh 放的（通常是电脑自己在放原声）
+    const maxK = Math.max(0, ...devs.map(known)), quietFrom = wins[wins.length - 1].to + 300, quietTo = quietFrom + 1600 + maxK;
+    const end = quietTo + 200;
+    for (const w of wins) {
+      if (w.did === 'self') this.selfEngine.solo(w.from, w.to, end);
+      else for (const c of this.link.clients.values()) if (c.did === w.did) this.link.send(c, { t: 'solo', from: w.from, to: w.to, end });
+    }
+    out(`🎵 ${label}：各设备轮流单独放音乐，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
+    let data;
+    if (mic.recorder) {
+      await sleep(end + 300 - hostNow());
+      const r = mic.recorder.stop(); data = { rec: toRate(r.rec, r.sr, rate), startHost: r.startHost, inLat: r.inLat || 0 };
+    } else {
+      this.recParts = {}; this.recParts[micId] = [];
+      this.link.send(mic.client, { t: 'measure', kind: 'raw', end: end + 300 });
+      const r = await this.waitFor(micId, end - hostNow() + 30000);
+      if (!r || r.t !== 'measureResult' || !r.raw) throw new Error('录音设备没有返回录音（请确认它是新版本）');
+      const parts = this.recParts[micId] || [];
+      if (parts.length < r.raw.n || parts.some((p) => !p)) throw new Error('录音没有完整传回来，请再试一次');
+      const bin = atob(parts.join('')), u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      const pcm = new Int16Array(u8.buffer, 0, u8.length >> 1), x = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) x[i] = pcm[i] / 32768;
+      data = { rec: x, startHost: r.raw.startHost, inLat: r.raw.inLat };
+    }
+    out('🧮 比对中…'); await sleep(30);
+    const res = alignMusic(data, wins, (t, n, rr) => this.srcExcerpt(t, n, rr), rate, search);
+    window.__smLastMusic = res.map((r) => ({ ...r })); // 排查用
+    // 全部静音的那段：还听得到同一首歌 → 有不受 SoundMesh 控制的声音（电脑原声等）
+    const ec = findEarlyCopy(data, quietFrom + 500 + maxK, quietTo - 50, 0, 700, (t, n, rr) => this.srcExcerpt(t, n, rr), rate);
+    this.earlyCopy = ec && ec.found ? ec.lagMs : null;
+    return res.map((r, i) => ({ ...r, d: wins[i].d, val: r.ok ? r.offset - H.liveDelay : null }));
+  },
+
+  // 用正在播的音乐校准：测的就是音乐真正走的路线，最贴近实际听感
+  async musicCalibrate() {
+    if (this.calibrating) return;
+    const out = (h) => ($('#calibOut').innerHTML = h);
+    if (this.group()?.kind !== 'live' || !this.live.running) return toast('先开始共享电脑声音，并放一首一直有声音的歌（不要选安静的前奏），再按这个');
+    const micId = $('#calibMic').value;
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (!devs.length) return toast('还没有在线的播放设备');
+    // 音乐有固定节拍，搜索范围太大可能对到“差一拍”的位置：没校准过的设备先用“啾”声粗测，音乐只在很小的范围里精确对齐
+    if (devs.some((d) => !Number.isFinite(d.realLat))) {
+      out('先用“啾”声粗测一次各设备的延迟…');
+      await this.calibrate();
+      if (devs.some((d) => !Number.isFinite(d.realLat))) return; // 粗测没成功（结果已经显示了原因）
+    }
+    this.calibrating = true; for (const b of ['#calibBtn', '#musicCalBtn', '#checkBtn']) $(b) && ($(b).disabled = true);
+    const r1 = (v) => Math.round(v * 10) / 10;
+    try {
+      out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
+      // 第 1 步：用音乐测出每台设备实际出声的时刻（在粗测结果附近 ±40ms 内找）
+      const rows = await this.musicPass(devs, micId, 40, out, '第 1 步：测量');
+      const pm = this.plans(), good = rows.filter((r) => r.ok);
+      if (!good.length) throw new Error('没有比对成功：换一段持续有声音的歌、把录音设备放近一点、周围安静一点再试');
+      this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
+      for (const r of good) r.real = r.val - this.totalD(r.d, pm); // 这台设备真实的延迟（浏览器不知道的那部分）
+      // 让每台设备在你的位置同时出声：以最慢的为准，其他设备等它（微调都 ≥ 0）
+      const C = Math.max(...good.map((r) => (pm[r.d.id]?.delayMs || 0) + r.real));
+      for (const r of good) { r.d.realLat = r1(r.real); r.d.latencyMs = Math.max(0, Math.min(1000, r1(C - (pm[r.d.id]?.delayMs || 0) - r.real))); }
+      this.changed(); this.lastWire = ''; this.publish();
+      await sleep(2500); // 等新设置生效、设备追上
+      // 第 2 步：再测一次，确认误差；还差的再修一次
+      const chk = await this.musicPass(good.map((r) => r.d), micId, 25, out, '第 2 步：验证');
+      const cg = chk.filter((r) => r.ok);
+      for (const c of cg) {
+        const row = rows.find((r) => r.d === c.d);
+        row.resid = c.val - median(cg.map((x) => x.val));
+        if (Math.abs(row.resid) > 0.3) { c.d.latencyMs = r1(c.d.latencyMs - row.resid); row.fixed = true; }
+      }
+      const minLat = Math.min(...good.map((r) => r.d.latencyMs));
+      if (minLat < 0) for (const r of good) r.d.latencyMs = r1(r.d.latencyMs - minLat);
+      const verified = rows.filter((r) => r.resid !== undefined && !r.fixed);
+      const worst = Math.max(0, ...verified.map((r) => Math.abs(r.resid)));
+      const others = rows.filter((r) => r.other && r.other.ratio > 0.6 && Math.abs(r.other.ms) > 3);
+      const pcCopy = this.earlyCopy;
+      out(`✅ 用音乐校准完成${verified.length ? `：播放音乐时各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>` : ''}${rows.some((r) => r.fixed) ? '（个别设备已再修正，想确认可以再按一次）' : ''}
+        <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td>
+          <td>${r.ok ? `真实延迟 ${r.real.toFixed(1)} ms` : `<span style="color:var(--bad)">没比对成功</span><div class="muted">${r.quiet ? '这段时间几乎没声音：换一段一直有声音的歌' : this.chirpWhy(r.d).replace('测试音', '音乐')}</div>`}</td>
+          <td>${r.resid === undefined ? (r.ok ? '验证没比对成功' : '未调整') : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms`}</td>
+          <td class="muted">微调 → ${r.d.latencyMs} ms</td></tr>`).join('')}</table>
+        ${pcCopy !== null && pcCopy !== undefined ? `<div style="color:var(--bad);margin-top:6px">⚠️ <b>还听到一份不经过 SoundMesh 的同一首歌</b>（几乎没有延迟，比所有设备早了好几百毫秒）。这通常是<b>电脑自己在放原声</b>：共享“整个屏幕”时电脑不会静音。它会和其他设备形成回音，校准也救不了——请改成共享 YouTube Music 那个<b>分页</b>（会自动静音），或把电脑的系统音量关掉。</div>` : ''}
+        ${others.length ? `<div style="color:var(--warn,#f59f00);margin-top:4px">⚠️ 在 ${others.map((r) => esc(r.d.name)).join('、')} 单独出声的时候，还听到另一份同样的音乐（${others.map((r) => `${r.other.ms < 0 ? '早' : '晚'} ${Math.abs(r.other.ms).toFixed(0)} ms`).join('、')}）。通常是<b>电脑本身还在放原声</b>（共享整个屏幕时会这样）或有其他设备在放同一首歌——它不受 SoundMesh 控制，会听起来像回音。建议改成共享 YouTube 那个分页，或把电脑音量关掉。</div>` : ''}`);
+      $('#calibUndo').hidden = false;
+      this.changed();
+    } catch (e) {
+      out('❌ ' + esc(e.message || String(e)));
+    } finally {
+      this.calibrating = false; for (const b of ['#calibBtn', '#musicCalBtn', '#checkBtn']) $(b) && ($(b).disabled = false);
+    }
   },
 
   async calibrate() {
@@ -6138,7 +6341,7 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => this.opusFor(c)).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
-    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (this.delayFloor ? ` · 现在最低可到 ${this.delayFloor} ms${this.delayFloorBy && (this.plans()[this.delayFloorBy.id]?.D || 0) < -30 ? `（${this.delayFloorBy.name} 的延迟微调是 ${Math.round(this.plans()[this.delayFloorBy.id].D)} ms，要“提前播”这么多，所以需要更多缓冲）` : ''}` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
+    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (this.delayFloor ? ` · 现在最低可到 ${this.delayFloor} ms${this.delayFloorBy && this.totalD(this.delayFloorBy) < -30 ? `（${this.delayFloorBy.name} 的延迟微调是 ${Math.round(this.totalD(this.delayFloorBy))} ms，要“提前播”这么多，所以需要更多缓冲）` : ''}` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️', android: '手机 App 声音 ✅' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
       ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface === 'android' ? '（这台手机会照常播放原声，比其他设备早一点）' : this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN ? `${opusN} 台用 Opus ${H.quality === 'standard' ? '160' : '320'}kbps、` : ''}${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
@@ -6563,6 +6766,19 @@ const node = {
         await sleep(Math.max(0, m.end - this.clock.now()));
         const rec = this.rec; this.rec = null;
         const data = rec.stop();
+        if (m.kind === 'raw') {
+          // 把录音（24kHz、16 位）分段传回控制端，由控制端和原声比对
+          const x = toRate(data.rec, data.sr, 24000), pcm = new Int16Array(x.length);
+          for (let i = 0; i < x.length; i++) pcm[i] = Math.max(-32768, Math.min(32767, Math.round(x[i] * 32767)));
+          const bytes = new Uint8Array(pcm.buffer), PART = 24000, n = Math.ceil(bytes.length / PART);
+          for (let i = 0; i < n; i++) {
+            let s = ''; const sub = bytes.subarray(i * PART, (i + 1) * PART);
+            for (let j = 0; j < sub.length; j += 0x8000) s += String.fromCharCode.apply(null, sub.subarray(j, j + 0x8000));
+            this.link.send({ t: 'recPart', i, b64: btoa(s) });
+          }
+          this.link.send({ t: 'measureResult', raw: { n, startHost: data.startHost, inLat: data.inLat || 0, rate: 24000 } });
+          return;
+        }
         const results = m.kind === 'spectrum'
           ? analyzeWindows(data, m.windows, m.noise)
           : detectChirps(data, m.slots).map((r) => ({ did: r.did, err: r.err, ok: r.ok }));

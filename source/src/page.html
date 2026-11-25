@@ -153,7 +153,8 @@
         <div class="small muted">每台设备会轮流发出“啾”声，由一个麦克风在<b>听众位</b>录下来，自动算出每台设备快了还是慢了多少，再填进它的“延迟微调”。蓝牙音箱、不同手机的扬声器延迟都能这样校准。</div>
         <div class="row small"><span>录音设备</span><select id="calibMic" class="grow"></select></div>
         <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
-        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="calibUndo" class="small" hidden>撤销</button></div>
+        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="musicCalBtn" class="primary">🎵 用正在播的音乐校准（更准）</button><button id="calibUndo" class="small" hidden>撤销</button></div>
+        <div class="small muted">“用音乐校准”：先开始共享电脑声音、放一首一直有声音的歌，再按。各设备轮流单独放几秒，直接测音乐真正到你耳朵的时间——测的就是你实际听到的，比“啾”声更准，还能发现电脑自己在放原声这类问题。</div>
         <div id="calibOut" class="small"></div>
         <hr style="border:0;border-top:1px solid var(--line);width:100%">
         <div class="small muted"><b>🔍 分工检查</b>：播放音乐时，各设备轮流单独出声约 2.6 秒，用同一个麦克风录下来，看每台<b>实际</b>放出来的是低音、人声中频、打击还是高频，确认分工有没有生效。</div>
