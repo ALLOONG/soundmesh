@@ -179,7 +179,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'high', pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'auto', pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -370,6 +370,21 @@ const host = {
   // ---------- 实时音源 ----------
   updateOpusWant() {},
   useOpus() { return (H.quality || (H.opus ? 'high' : 'lossless')) !== 'lossless'; },
+  // 这台设备现在用不用 Opus：自动模式下网络好用无损，这台设备网络跟不上时才临时换 Opus 320
+  opusFor(c) { return !!c.opus && (H.quality === 'auto' ? !!c.autoOpus : this.useOpus()); },
+  // 每秒检查一次各设备的网络（自动音质用）：排队数据太多 / 有丢弃 / 设备那边迟到变多 → 换 Opus；稳定 60 秒后再试无损
+  checkLinks() {
+    if (H.quality !== 'auto') return;
+    const now = performance.now();
+    for (const c of this.link?.clients.values() || []) {
+      if (!c.did || !c.opus) continue;
+      const d = H.devices[c.did], late = d?.stats?.live?.late ?? 0, dropped = c.dropped || 0;
+      const bad = this.link.buffered(c) > 48 * 1024 || dropped > (c.lastDropped ?? dropped) || late > (c.lastLate ?? late) + 1;
+      c.lastDropped = dropped; c.lastLate = late;
+      if (bad) { if (!c.autoOpus) toast(`📶 ${d?.name || '设备'} 的网络跟不上无损，暂时改用 Opus 320（几乎听不出差别）`); c.autoOpus = true; c.autoSince = now; }
+      else if (c.autoOpus && now - c.autoSince > 60000) { c.autoOpus = false; } // 稳定一分钟：再试无损
+    }
+  },
   needs(did, src) { return !!this.need[did]?.has(src); },
   anyNeeds(src) { return Object.values(this.need).some((set) => set.has(src)); },
   onLiveChunk({ frame, ts, l, r }) {
@@ -431,8 +446,9 @@ const host = {
     let pcm = null, wantOpus = false;
     for (const c of this.link?.clients.values() || []) {
       if (!c.did || !this.needs(c.did, src)) continue;
-      if (this.useOpus() && c.opus && this.encoderFor(src, planes.length).ok) { wantOpus = true; continue; }
-      if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; } // 网络跟不上：丢这一段
+      if (this.opusFor(c) && this.encoderFor(src, planes.length).ok) { wantOpus = true; continue; }
+      // 网络跟不上：排队的数据已经超过约半秒（之后的声音反正会迟到）→ 丢这一段，让网络先缓过来
+      if (this.link.buffered(c) > 96 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
       pcm = pcm || pcmEncode(planes);
       if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: planes.length, s: src }, pcm))) this.dg.sent++;
     }
@@ -443,11 +459,11 @@ const host = {
     if (!e) {
       e = new StreamEncoder(ch, (ts, data) => {
         for (const c of this.link?.clients.values() || []) {
-          if (!c.did || !c.opus || !this.useOpus() || !this.needs(c.did, src)) continue;
-          if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
+          if (!c.did || !this.opusFor(c) || !this.needs(c.did, src)) continue;
+          if (this.link.buffered(c) > 24 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
           if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: src }, data))) this.dg.sent++;
         }
-      }, H.quality);
+      }, H.quality === 'standard' ? 'standard' : 'high');
       this.encoders.set(src, e);
     }
     return e;
@@ -592,6 +608,7 @@ const host = {
   },
 
   tick() {
+    this.checkLinks();
     const g = this.group();
     if (H.playback.status === 'playing' && g && g.kind !== 'live' && !g.loop && this.position() > g.duration + 0.5) {
       H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
@@ -1106,7 +1123,7 @@ const host = {
     $('#mirrorOffsetVal').textContent = `${(H.mirrorOffset || 0) > 0 ? '+' : ''}${H.mirrorOffset || 0} ms`;
     $('#mirrorInfo').textContent = `画面延后 ${Math.round(this.mirrorDelay())} ms，和手机的声音对齐`;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
-    const opusN = clients.filter((c) => c.opus && this.useOpus()).length;
+    const opusN = clients.filter((c) => this.opusFor(c)).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
     const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️', android: '手机 App 声音 ✅' }[this.live.surface] || '未知';
@@ -1481,8 +1498,13 @@ const node = {
       if (s === 'open') { this.clock.reset(); this.burst(16); for (const f of this.files.values()) if (!f.done) this.link.send({ t: 'getFile', id: f.id }); }
       this.render();
     });
-    this.link.addEventListener('msg', (e) => this.onMsg(e.detail));
-    this.link.addEventListener('bin', (e) => this.onBin(e.detail));
+    this.lastRx = performance.now();
+    this.link.addEventListener('msg', (e) => { this.lastRx = performance.now(); this.onMsg(e.detail); });
+    this.link.addEventListener('bin', (e) => { this.lastRx = performance.now(); this.onBin(e.detail); });
+    // 心跳：控制端每几秒一定会回应对时；超过 7 秒什么都没收到 = 连接假死，马上重连
+    setInterval(() => {
+      if (this.link.connected && performance.now() - this.lastRx > 7000) { this.lastRx = performance.now(); this.link.kick?.(); }
+    }, 1000);
     setInterval(() => this.burst(4), 4000); // 更密的对时：每 4 秒 4 个 ping（流量很小）
     setInterval(() => this.sendStats(), 2000);
     setInterval(() => this.render(), 500);

@@ -272,6 +272,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
           <label><input type="checkbox" id="pcPlay" /> 电脑也出声（关掉 = 只有手机/平板出声，电脑静音）</label>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
           <label>音质 <select id="quality">
+            <option value="auto">🤖 自动（推荐：网络好用无损，哪台网络跟不上就那台临时换 Opus 320）</option>
             <option value="lossless">🎧 无损（原始 CD 音质，每台约 1.5 Mbps，手机热点/家里 Wi-Fi 都够）</option>
             <option value="high">⭐ 高音质（Opus 320kbps，几乎听不出差别，流量只要无损的 1/5）</option>
             <option value="standard">省流量（Opus 160kbps，网络差的时候用）</option>
@@ -3584,6 +3585,72 @@ function motionAngle(mo, t) {
   return -180 + frac * 360;
 }
 
+// 实时音频播放器（在音频线程里运行）：一条按“采样点编号”索引的环形时间线。
+// 收到的每段声音按它该播的确切采样点写进去，音频线程连续往外读——段与段之间没有接缝，不会多一个或少一个采样点。
+const PLAYER_SRC = `
+// 丢包补偿也在这里做：一发现某个采样点没有数据，立刻把刚播过的 20ms 倒着放并淡出；
+// 数据回来时再用 4ms 交叉淡入。因为是在音频线程里逐个采样点判断，不受网页忙不忙影响，绝不会硬切。
+const CL = 960, FI = 192, H = 2048;
+class SMLivePlayer extends AudioWorkletProcessor {
+  constructor(o) {
+    super();
+    this.ch = o.processorOptions.ch; this.size = 1 << 18; this.mask = this.size - 1; this.hi = 0;
+    this.ring = []; this.hist = []; this.cbuf = [];
+    for (let c = 0; c < this.ch; c++) { this.ring.push(new Float32Array(this.size)); this.hist.push(new Float32Array(H)); this.cbuf.push(new Float32Array(CL)); }
+    this.valid = new Uint8Array(this.size);
+    this.hpos = 0; this.hcount = 0; this.missing = true; this.concealing = false; this.ck = 0; this.fade = 0; this.conceals = 0;
+    this.port.onmessage = (e) => {
+      const m = e.data, mask = this.mask, lim = currentFrame + this.size - 256;
+      if (m.w) {
+        const f = m.f, n = m.w[0].length;
+        for (let i = Math.max(0, currentFrame - f); i < n; i++) {
+          const fi = f + i; if (fi >= lim) break;
+          const j = fi & mask; this.valid[j] = 1;
+          for (let c = 0; c < this.ch; c++) this.ring[c][j] = (m.w[c] || m.w[0])[i];
+        }
+        if (f + n > this.hi) this.hi = f + n;
+      } else if (m.cut !== undefined) {
+        const T = m.cut, k = m.fade || 192;
+        for (let fi = Math.max(currentFrame, T - k); fi < T; fi++) for (let c = 0; c < this.ch; c++) this.ring[c][fi & mask] *= (T - fi) / k;
+        for (let fi = Math.max(currentFrame, T); fi < Math.min(this.hi, lim); fi++) { const j = fi & mask; this.valid[j] = 0; for (let c = 0; c < this.ch; c++) this.ring[c][j] = 0; }
+      } else if (m.clear) { for (const r of this.ring) r.fill(0); this.valid.fill(0); this.hi = 0; this.missing = true; this.concealing = false; this.hcount = 0; }
+      else if (m.stats) this.port.postMessage({ conceals: this.conceals });
+    };
+  }
+  process(inputs, outputs) {
+    const out = outputs[0], n = out[0].length, mask = this.mask, ch = this.ch;
+    for (let i = 0; i < n; i++) {
+      const j = (currentFrame + i) & mask;
+      if (this.valid[j]) {
+        if (this.missing) { this.missing = false; this.fade = FI; }
+        let g = 1;
+        if (this.fade > 0) { g = 1 - this.fade / FI; this.fade--; }
+        for (let c = 0; c < ch; c++) {
+          let v = this.ring[c][j];
+          if (g < 1) v = v * g + (this.concealing && this.ck < CL ? this.cbuf[c][this.ck] * (1 - this.ck / CL) : 0) * (1 - g);
+          this.hist[c][this.hpos] = v;
+          if (c < out.length) out[c][i] = v;
+        }
+        if (g < 1) this.ck++; else this.concealing = false;
+        this.hpos = (this.hpos + 1) & (H - 1); if (this.hcount < H) this.hcount++;
+      } else {
+        if (!this.missing) {
+          // 刚断：把最近的 20ms 倒过来准备好（从倒数第二个采样点开始，接缝处波形连续）
+          this.missing = true; this.ck = 0; this.concealing = this.hcount >= CL + 2;
+          if (this.concealing) { this.conceals++; for (let c = 0; c < ch; c++) for (let k = 0; k < CL; k++) this.cbuf[c][k] = this.hist[c][(this.hpos - 2 - k + 2 * H) & (H - 1)]; }
+        }
+        for (let c = 0; c < ch; c++) if (c < out.length) out[c][i] = this.concealing && this.ck < CL ? this.cbuf[c][this.ck] * (1 - this.ck / CL) : 0;
+        if (this.concealing) this.ck++;
+      }
+      this.valid[j] = 0; for (let c = 0; c < ch; c++) this.ring[c][j] = 0;
+    }
+    for (let c = ch; c < out.length; c++) out[c].set(out[ch - 1]);
+    return true;
+  }
+}
+registerProcessor('sm-live-player', SMLivePlayer);
+`;
+
 class Engine extends EventTarget {
   constructor(clock, { fetchFile } = {}) {
     super();
@@ -3597,7 +3664,21 @@ class Engine extends EventTarget {
     // （硬件不是 48k 的手机，由浏览器在最后输出时用高质量方式转换）
     try { this.ctx = new AC({ latencyHint: 'interactive', sampleRate: 48000 }); } catch { this.ctx = new AC({ latencyHint: 'interactive' }); }
     this.master = this.ctx.createGain();
-    this.master.connect(this.ctx.destination);
+    // 防破音：音量开到 100% 以上时，超过 -1dB 的峰值被圆滑地压住（不会硬切成“沙沙”声）；
+    // 平时（-1dB 以下）完全原样通过，一个采样点都不改
+    this.limIn = this.ctx.createGain(); this.limIn.gain.value = 0.5;
+    this.limiter = this.ctx.createWaveShaper();
+    { const n = 8193, c = new Float32Array(n), t = 0.891;
+      for (let i = 0; i < n; i++) { const s = ((i / (n - 1)) * 2 - 1) * 2, a = Math.abs(s);
+        c[i] = a <= t ? s : Math.sign(s) * (t + (1 - t) * Math.tanh((a - t) / (1 - t))); }
+      this.limiter.curve = c; this.limiter.oversample = 'none'; }
+    this.master.connect(this.limIn); this.limIn.connect(this.limiter); this.limiter.connect(this.ctx.destination);
+    // 载入实时音频播放器（不支持的老浏览器自动用旧方式）
+    this.livePlayers = new Map(); this.wl = false;
+    try {
+      const url = URL.createObjectURL(new Blob([PLAYER_SRC], { type: 'application/javascript' }));
+      this.ctx.audioWorklet?.addModule(url).then(() => { this.wl = true; }).catch(() => {});
+    } catch {}
     this.deviceGain = this.ctx.createGain();
     this.motionGain = this.ctx.createGain(); // 环绕移动音效：在设备增益之后再乘一层随时间变化的增益
     this.hushGain = this.ctx.createGain(); // 暂停检测：音源一暂停就立刻静音
@@ -3642,19 +3723,20 @@ class Engine extends EventTarget {
   // 切到别的应用、甚至锁屏后通常也能继续放。代价：多一段系统缓冲，延迟会变大一点，开启后建议重新校准。
   async setBackgroundMode(on) {
     if (on === !!this.bgMode) return;
-    try { this.master.disconnect(); } catch {}
+    const out = this.limiter; // 最后一级（防破音）之后才分流到不同的出口
+    try { out.disconnect(); } catch {}
     if (on) {
       this.bgDest = this.bgDest || this.ctx.createMediaStreamDestination();
-      this.master.connect(this.bgDest);
+      out.connect(this.bgDest);
       if (!this.bgEl) { this.bgEl = new Audio(); this.bgEl.setAttribute('playsinline', ''); }
       this.bgEl.srcObject = this.bgDest.stream;
       try { await this.bgEl.play(); } catch (e) {
-        this.master.disconnect(); this.master.connect(this.ctx.destination);
+        out.disconnect(); out.connect(this.ctx.destination);
         throw e;
       }
     } else {
       try { this.bgEl?.pause(); } catch {}
-      this.master.connect(this.ctx.destination);
+      out.connect(this.ctx.destination);
     }
     this.bgMode = on;
   }
@@ -3925,14 +4007,76 @@ class Engine extends EventTarget {
   }
   teardownLive() {
     if (!this.liveIns.size && !this.liveVoices.length) return;
-    for (const src of this.liveSources) { try { src.stop(); } catch {} }
+    for (const it of this.liveSources) { try { it.src.stop(); } catch {} }
+    for (const t of (this.liveWd || new Map()).values()) clearTimeout(t);
     this.liveSources.clear();
     for (const n of this.liveIns.values()) try { n.disconnect(); } catch {}
+    for (const p of this.livePlayers.values()) try { p.port.postMessage({ clear: 1 }); p.disconnect(); } catch {}
+    this.livePlayers = new Map(); this.liveCursorF = new Map(); this.liveStateW = new Map();
     for (const v of this.liveVoices) { try { v.out.disconnect(); } catch {} v.nodes.forEach((n) => { try { n.disconnect(); } catch {} }); }
     this.liveIns = new Map(); this.liveVoices = []; this.liveSig = null; this.liveCursor = new Map();
   }
   // 收到一段实时音频：在“采集时刻 + 统一缓冲延迟 + 本机延迟”播出
+  // 把一段声音拉长/缩短几个采样点（三次插值，首尾采样点不变，所以和前后段无缝衔接）。
+  // 不用浏览器的 playbackRate：它变速时首尾会多出/少掉一个采样点，和下一段叠在一起就是“喀”
+  stretch(buffer, M) {
+    const N = buffer.length, out = this.ctx.createBuffer(buffer.numberOfChannels, M, buffer.sampleRate), k = (N - 1) / (M - 1);
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      const x = buffer.getChannelData(c), y = out.getChannelData(c);
+      for (let j = 0; j < M; j++) {
+        const p = j * k, i = Math.floor(p), t = p - i;
+        const x0 = x[i > 0 ? i - 1 : 0], x1 = x[i], x2 = x[i + 1 < N ? i + 1 : N - 1], x3 = x[i + 2 < N ? i + 2 : N - 1];
+        y[j] = x1 + 0.5 * t * (x2 - x0 + t * (2 * x0 - 5 * x1 + 4 * x2 - x3 + t * (3 * (x1 - x2) + x3 - x0)));
+      }
+    }
+    return out;
+  }
+
+  // 排一段声音：每段都有自己的音量节点，方便在接缝处淡入/淡出（避免“喀”声）
+  liveSchedule(srcName, buffer, when, rate, fadeIn, fadeOut) {
+    const input = this.liveIns.get(srcName);
+    if (!input) return null;
+    const src = this.ctx.createBufferSource(), g = this.ctx.createGain();
+    src.buffer = buffer;
+    src.playbackRate.value = rate;
+    src.connect(g); g.connect(input);
+    const dur = buffer.duration / rate, end = this.at(when + dur);
+    if (fadeIn) { g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(1, when + Math.min(fadeIn, dur)); }
+    if (fadeOut) { g.gain.setValueAtTime(1, Math.max(when, end - fadeOut)); g.gain.linearRampToValueAtTime(0, end); }
+    src.start(when);
+    const it = { src, g, start: when, end, srcName };
+    src.onended = () => { this.liveSources.delete(it); try { src.disconnect(); g.disconnect(); } catch {} };
+    this.liveSources.add(it);
+    return it;
+  }
+
+  // 在时刻 T 把这个来源已经排好的声音收掉：还没开始的直接取消，正在响的在 T 之前 4ms 淡出
+  liveCut(srcName, T) {
+    const now = this.ctx.currentTime;
+    for (const it of this.liveSources) {
+      if (it.srcName !== srcName || it.end <= T) continue;
+      if (it.start >= T - 0.0005 && it.start > now + 0.003) { try { it.src.stop(); } catch {} this.liveSources.delete(it); continue; }
+      const a = Math.max(now + 0.001, T - 0.004);
+      try { it.g.gain.cancelScheduledValues(a); it.g.gain.setValueAtTime(it.g.gain.value, a); it.g.gain.linearRampToValueAtTime(0, Math.max(a + 0.001, T)); it.src.stop(Math.max(a + 0.002, T) + 0.002); } catch {}
+    }
+  }
+
+  // 丢包补偿：用上一段声音“倒着放”补上缺的部分（接缝处波形连续，不会喀），同时慢慢淡出
+  liveConceal(srcName, at, len) {
+    const last = this.liveLast?.get(srcName);
+    if (!last || len <= 0) return;
+    const n = last.length, m = Math.min(n, Math.round(len * this.ctx.sampleRate));
+    const b = this.ctx.createBuffer(last.numberOfChannels, m, this.ctx.sampleRate);
+    for (let c = 0; c < last.numberOfChannels; c++) {
+      const src = last.getChannelData(c), dst = b.getChannelData(c);
+      for (let i = 0; i < m; i++) dst[i] = src[n - 1 - i];
+    }
+    this.liveSchedule(srcName, b, this.at(at), 1, 0, m / this.ctx.sampleRate);
+    this.liveStats.concealed = (this.liveStats.concealed || 0) + 1;
+  }
+
   pushLive(ts, buffer, srcName = 'live') {
+    if (this.wl) return this.pushLiveW(ts, buffer, srcName);
     const cur = this.cur;
     const input = this.liveIns.get(srcName);
     if (!this.unlocked || !this.clock.synced || !cur?.plan || cur.group?.kind !== 'live' || !input) return;
@@ -3940,32 +4084,135 @@ class Engine extends EventTarget {
     const expected = this.clockToCtx(ts + (cur.ld || 350) + cur.plan.D);
     const now = this.ctx.currentTime;
     if (expected + buffer.duration < now + 0.005) { this.liveStats.late++; return; } // 来得太晚，丢掉
-    let when, rate = 1;
+    const wd = this.liveWd || (this.liveWd = new Map()), last = this.liveLast || (this.liveLast = new Map());
+    const st = this.liveState || (this.liveState = new Map());
+    clearTimeout(wd.get(srcName));
+    let when, rate = 1, fadeIn = 0;
     const cursor = this.liveCursor.get(srcName) ?? null;
+    const gap = cursor === null ? null : expected - cursor;
     const ema = this.liveErr || (this.liveErr = new Map());
-    if (cursor === null || Math.abs(cursor - expected) > 0.04) {
+    if (cursor === null || st.get(srcName) === 'gap' || gap < -0.04 || gap > 0.25) {
+      // 重新对齐（刚开始 / 网络卡太久之后 / 误差太大）：把旧的声音在接点淡出，新的淡入
       when = this.at(Math.max(expected, now + 0.005));
-      this.liveStats.resyncs++;
+      if (cursor !== null) this.liveCut(srcName, when);
+      fadeIn = cursor === null ? 0.01 : 0.004;
+      if (cursor !== null) this.liveStats.resyncs++;
       ema.set(srcName, 0);
+    } else if (gap > 0.004) {
+      // 中间少了一段（控制端因为网络塞车丢掉的）：补上那一段，时间线不动，新的一段淡入
+      this.liveConceal(srcName, cursor, gap);
+      when = this.at(expected);
+      fadeIn = 0.004;
     } else {
-      // 紧接上一段播放（无缝）。误差先做平均（约 1 秒），滤掉时间读数的抖动，再用极小的变速持续追平：
-      // 设备时钟快/慢几十 ppm 时只需要 0.005% 左右的变速（完全听不出），各设备都能稳定在 0.5ms 以内。
-      // 只有缓冲刚调整、误差超过 15ms 时才用到 ±0.3%
-      when = this.at(cursor); // 对齐到采样点（变速后的接缝最多差半个采样点，约 0.01ms，听不出）
-      const raw = cursor - expected, e = (ema.get(srcName) ?? raw) * 0.95 + raw * 0.05;
+      // 紧接上一段播放（无缝）。平时完全按原速、逐个采样点原样播放（音质 100% 不变）；
+      // 误差（先做约 1 秒的平均，滤掉时间读数抖动）累积到 1 个采样点（0.02ms）以上时，
+      // 才让这一段多放或少放 1 个采样点（只这 20ms 变速 0.1%，听不出），各设备都稳定在 0.5ms 以内。
+      // 只有缓冲刚调整、误差超过 15ms 时，每段最多调 3 个采样点（0.3%）快速追上。
+      when = this.at(cursor);
+      const sr = this.ctx.sampleRate, raw = cursor - expected;
+      let e = (ema.get(srcName) ?? raw) * 0.95 + raw * 0.05;
+      const es = e * sr;
+      let d = 0;
+      if (Math.abs(e) > 0.015) d = Math.sign(es) * 3;
+      else if (Math.abs(es) >= 1.5) d = Math.sign(es);
+      if (d) { buffer = this.stretch(buffer, buffer.length - d); e -= d / sr; }
       ema.set(srcName, e);
-      const lim = Math.abs(e) > 0.015 ? 0.003 : 0.0007;
-      rate = Math.abs(e) < 0.0001 ? 1 : 1 + Math.max(-lim, Math.min(lim, e * 3));
     }
-    const src = this.ctx.createBufferSource();
-    src.buffer = buffer;
-    src.playbackRate.value = rate;
-    src.connect(input);
-    src.start(when);
-    src.onended = () => { this.liveSources.delete(src); try { src.disconnect(); } catch {} };
-    this.liveSources.add(src);
-    this.liveCursor.set(srcName, when + buffer.duration / rate);
+    st.set(srcName, 'ok');
+    this.liveSchedule(srcName, buffer, when, rate, fadeIn, 0);
+    const end = this.at(when + buffer.duration / rate); // 一段占整数个采样点，下一段的起点也落在采样点上
+    this.liveCursor.set(srcName, end);
+    last.set(srcName, buffer);
     this.liveStats.err = (when - expected) * 1000;
+    // 看门狗：快播到这一段结尾了，下一段还没到（网络卡住）→ 提前补一段并淡出，之后静音，等数据回来再淡入
+    const ms = (end - this.ctx.currentTime - 0.03) * 1000;
+    wd.set(srcName, setTimeout(() => {
+      if (this.liveCursor.get(srcName) !== end || st.get(srcName) === 'gap') return;
+      this.liveConceal(srcName, end, buffer.duration);
+      st.set(srcName, 'gap');
+    }, Math.max(0, ms)));
+  }
+
+  // ---------- 新方式：写进音频线程里的连续时间线（采样点精确） ----------
+  player(srcName, ch) {
+    let p = this.livePlayers.get(srcName);
+    if (!p) {
+      const input = this.liveIns.get(srcName);
+      if (!input) return null;
+      p = new AudioWorkletNode(this.ctx, 'sm-live-player', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [ch], processorOptions: { ch } });
+      p.connect(input);
+      this.livePlayers.set(srcName, p);
+    }
+    return p;
+  }
+  stretchArr(planes, M) {
+    const N = planes[0].length, k = (N - 1) / (M - 1);
+    return planes.map((x) => {
+      const y = new Float32Array(M);
+      for (let j = 0; j < M; j++) {
+        const p = j * k, i = Math.floor(p), t = p - i;
+        const x0 = x[i > 0 ? i - 1 : 0], x1 = x[i], x2 = x[i + 1 < N ? i + 1 : N - 1], x3 = x[i + 2 < N ? i + 2 : N - 1];
+        y[j] = x1 + 0.5 * t * (x2 - x0 + t * (2 * x0 - 5 * x1 + 4 * x2 - x3 + t * (3 * (x1 - x2) + x3 - x0)));
+      }
+      return y;
+    });
+  }
+  // 丢包补偿：上一段声音倒着放（接缝处波形连续），同时淡出到 0
+  concealW(p, srcName, atF, len) {
+    const last = this.liveLastW?.get(srcName);
+    if (!last || len <= 0) return;
+    const n = last[0].length, m = Math.min(n, len);
+    const w = last.map((x) => { const y = new Float32Array(m); for (let i = 0; i < m; i++) y[i] = x[n - 1 - i] * (1 - (i + 1) / m); return y; });
+    p.port.postMessage({ f: atF, w }, w.map((a) => a.buffer));
+    this.liveStats.concealed = (this.liveStats.concealed || 0) + 1;
+  }
+  pushLiveW(ts, buffer, srcName) {
+    const cur = this.cur;
+    if (!this.unlocked || !this.clock.synced || !cur?.plan || cur.group?.kind !== 'live' || !this.liveIns.get(srcName)) return;
+    const ch = buffer.numberOfChannels, p = this.player(srcName, ch);
+    if (!p) return;
+    this.liveStats.got++;
+    const sr = this.ctx.sampleRate, N = buffer.length;
+    const expF = Math.round(this.clockToCtx(ts + (cur.ld || 350) + cur.plan.D) * sr);
+    const minF = Math.round((this.ctx.currentTime + 0.012) * sr); // 至少提前 12ms 交给音频线程
+    if (expF + N < minF) { this.liveStats.late++; return; } // 来得太晚，丢掉
+    const curs = this.liveCursorF || (this.liveCursorF = new Map()), st = this.liveStateW || (this.liveStateW = new Map());
+    const wd = this.liveWd || (this.liveWd = new Map()), lastM = this.liveLastW || (this.liveLastW = new Map());
+    const ema = this.liveErr || (this.liveErr = new Map());
+    let planes = []; for (let c = 0; c < ch; c++) planes.push(buffer.getChannelData(c).slice());
+    const cursor = curs.get(srcName) ?? null, gap = cursor === null ? null : expF - cursor;
+    let startF, fadeIn = 0;
+    if (cursor === null || cursor < minF || gap < -0.04 * sr || gap > 0.25 * sr) {
+      // 重新对齐（刚开始 / 网络卡太久之后 / 误差太大）：旧的在接点淡出，新的淡入
+      startF = Math.max(expF, minF);
+      if (cursor !== null) { p.port.postMessage({ cut: startF, fade: 192 }); this.liveStats.resyncs++; }
+      fadeIn = cursor === null ? 480 : 192;
+      ema.set(srcName, 0);
+      if (startF > expF) { const skip = startF - expF; if (skip >= N) return; planes = planes.map((x) => x.subarray(skip)); }
+    } else if (gap >= N / 2) {
+      // 中间少了一段（控制端因为网络塞车丢掉的）：时间线不动，照常写在它该在的位置；
+      // 缺的那一小段由音频线程自动补偿、淡出，再交叉淡入这一段
+      startF = expF;
+      this.liveStats.concealed = (this.liveStats.concealed || 0) + 1;
+    } else {
+      // 紧接上一段，逐个采样点原样播放；误差累积到 1.5 个采样点（0.03ms）才让这一段多/少 1 个采样点
+      startF = cursor;
+      const raw = cursor - expF;
+      let e = (ema.get(srcName) ?? raw) * 0.95 + raw * 0.05, d = 0;
+      // 平时每段最多调 1 个采样点（0.1%，约 1.7 音分，听不出）；只有误差超过 15ms（缓冲刚调整）才用 3 个（0.3%）
+      if (Math.abs(e) > 0.015 * sr) d = Math.sign(e) * 3;
+      else if (Math.abs(e) >= 1.5) d = Math.sign(e);
+      if (d) { planes = this.stretchArr(planes, N - d); e -= d; }
+      ema.set(srcName, e);
+    }
+    if (fadeIn) { const k = Math.min(fadeIn, planes[0].length); for (const x of planes) for (let i = 0; i < k; i++) x[i] *= i / k; }
+    const len = planes[0].length;
+    lastM.set(srcName, planes.map((x) => x.slice()));
+    p.port.postMessage({ f: startF, w: planes }, planes.map((a) => a.buffer));
+    st.set(srcName, 'ok');
+    const end = startF + len;
+    curs.set(srcName, end);
+    this.liveStats.err = ((startF - expF) / sr) * 1000;
   }
 
   updateParams(plan) {
@@ -4291,6 +4538,14 @@ class AutoNodeLink extends EventTarget {
     }, 6000);
   }
   send(msg) { this.cur.send(msg); }
+  // 连接“假死”（Wi-Fi 闪断后浏览器还以为连着）：立刻换一条新连接，不等浏览器 30 秒后才发现
+  kick() {
+    const old = this.cur, next = new old.constructor(this.code, this.helloFn);
+    old.close();
+    this.use(next);
+    this.dispatchEvent(new CustomEvent('status', { detail: 'lost' }));
+    this.armFallback();
+  }
 }
 
 // ===== live.js =====
@@ -4339,7 +4594,7 @@ class LiveCapture extends EventTarget {
     if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('这个浏览器不支持共享声音，请在电脑上用 Chrome 或 Edge');
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: true, restrictOwnAudio: true },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, sampleRate: { ideal: 48000 }, suppressLocalAudioPlayback: true, restrictOwnAudio: true },
       systemAudio: 'include', selfBrowserSurface: 'exclude', surfaceSwitching: 'include',
     });
     if (!stream.getAudioTracks().length) {
@@ -4881,7 +5136,7 @@ function defaultHostState(code) {
     code, size: { w: 8, h: 5 }, listener: { x: 4, y: 3.5 }, devices: {},
     mode: 'sync', gainPreset: 'balanced', options: { distanceGain: true, distanceDelay: true, stereo: true },
     stereoWidth: 1, splitPreset: 'auto', bands: { lowCut: 150, highCut: 2500 }, masterVolume: 1,
-    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'high', pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
+    library: [], currentGroupId: 'demo-mix', liveDelay: 350, autoDelay: true, opus: true, quality: 'auto', pcPlay: true, liveStems: false, mirrorOffset: 0, videoMode: false, lyrics: null, ly: { a: null, s: 0, o: 0 }, motion: { y: 'off', p: 8, d: 0.85, t0: 0 },
     playback: { status: 'stopped', startServerTime: 0, startOffset: 0 }, colorIdx: 0,
   };
 }
@@ -5072,6 +5327,21 @@ const host = {
   // ---------- 实时音源 ----------
   updateOpusWant() {},
   useOpus() { return (H.quality || (H.opus ? 'high' : 'lossless')) !== 'lossless'; },
+  // 这台设备现在用不用 Opus：自动模式下网络好用无损，这台设备网络跟不上时才临时换 Opus 320
+  opusFor(c) { return !!c.opus && (H.quality === 'auto' ? !!c.autoOpus : this.useOpus()); },
+  // 每秒检查一次各设备的网络（自动音质用）：排队数据太多 / 有丢弃 / 设备那边迟到变多 → 换 Opus；稳定 60 秒后再试无损
+  checkLinks() {
+    if (H.quality !== 'auto') return;
+    const now = performance.now();
+    for (const c of this.link?.clients.values() || []) {
+      if (!c.did || !c.opus) continue;
+      const d = H.devices[c.did], late = d?.stats?.live?.late ?? 0, dropped = c.dropped || 0;
+      const bad = this.link.buffered(c) > 48 * 1024 || dropped > (c.lastDropped ?? dropped) || late > (c.lastLate ?? late) + 1;
+      c.lastDropped = dropped; c.lastLate = late;
+      if (bad) { if (!c.autoOpus) toast(`📶 ${d?.name || '设备'} 的网络跟不上无损，暂时改用 Opus 320（几乎听不出差别）`); c.autoOpus = true; c.autoSince = now; }
+      else if (c.autoOpus && now - c.autoSince > 60000) { c.autoOpus = false; } // 稳定一分钟：再试无损
+    }
+  },
   needs(did, src) { return !!this.need[did]?.has(src); },
   anyNeeds(src) { return Object.values(this.need).some((set) => set.has(src)); },
   onLiveChunk({ frame, ts, l, r }) {
@@ -5133,8 +5403,9 @@ const host = {
     let pcm = null, wantOpus = false;
     for (const c of this.link?.clients.values() || []) {
       if (!c.did || !this.needs(c.did, src)) continue;
-      if (this.useOpus() && c.opus && this.encoderFor(src, planes.length).ok) { wantOpus = true; continue; }
-      if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; } // 网络跟不上：丢这一段
+      if (this.opusFor(c) && this.encoderFor(src, planes.length).ok) { wantOpus = true; continue; }
+      // 网络跟不上：排队的数据已经超过约半秒（之后的声音反正会迟到）→ 丢这一段，让网络先缓过来
+      if (this.link.buffered(c) > 96 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
       pcm = pcm || pcmEncode(planes);
       if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: planes.length, s: src }, pcm))) this.dg.sent++;
     }
@@ -5145,11 +5416,11 @@ const host = {
     if (!e) {
       e = new StreamEncoder(ch, (ts, data) => {
         for (const c of this.link?.clients.values() || []) {
-          if (!c.did || !c.opus || !this.useOpus() || !this.needs(c.did, src)) continue;
-          if (this.link.buffered(c) > 512 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
+          if (!c.did || !this.opusFor(c) || !this.needs(c.did, src)) continue;
+          if (this.link.buffered(c) > 24 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
           if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: src }, data))) this.dg.sent++;
         }
-      }, H.quality);
+      }, H.quality === 'standard' ? 'standard' : 'high');
       this.encoders.set(src, e);
     }
     return e;
@@ -5294,6 +5565,7 @@ const host = {
   },
 
   tick() {
+    this.checkLinks();
     const g = this.group();
     if (H.playback.status === 'playing' && g && g.kind !== 'live' && !g.loop && this.position() > g.duration + 0.5) {
       H.playback = { status: 'stopped', startServerTime: 0, startOffset: 0 };
@@ -5808,7 +6080,7 @@ const host = {
     $('#mirrorOffsetVal').textContent = `${(H.mirrorOffset || 0) > 0 ? '+' : ''}${H.mirrorOffset || 0} ms`;
     $('#mirrorInfo').textContent = `画面延后 ${Math.round(this.mirrorDelay())} ms，和手机的声音对齐`;
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
-    const opusN = clients.filter((c) => c.opus && this.useOpus()).length;
+    const opusN = clients.filter((c) => this.opusFor(c)).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
     const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️', android: '手机 App 声音 ✅' }[this.live.surface] || '未知';
@@ -6183,8 +6455,13 @@ const node = {
       if (s === 'open') { this.clock.reset(); this.burst(16); for (const f of this.files.values()) if (!f.done) this.link.send({ t: 'getFile', id: f.id }); }
       this.render();
     });
-    this.link.addEventListener('msg', (e) => this.onMsg(e.detail));
-    this.link.addEventListener('bin', (e) => this.onBin(e.detail));
+    this.lastRx = performance.now();
+    this.link.addEventListener('msg', (e) => { this.lastRx = performance.now(); this.onMsg(e.detail); });
+    this.link.addEventListener('bin', (e) => { this.lastRx = performance.now(); this.onBin(e.detail); });
+    // 心跳：控制端每几秒一定会回应对时；超过 7 秒什么都没收到 = 连接假死，马上重连
+    setInterval(() => {
+      if (this.link.connected && performance.now() - this.lastRx > 7000) { this.lastRx = performance.now(); this.link.kick?.(); }
+    }, 1000);
     setInterval(() => this.burst(4), 4000); // 更密的对时：每 4 秒 4 个 ping（流量很小）
     setInterval(() => this.sendStats(), 2000);
     setInterval(() => this.render(), 500);

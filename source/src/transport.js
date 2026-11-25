@@ -276,4 +276,12 @@ export class AutoNodeLink extends EventTarget {
     }, 6000);
   }
   send(msg) { this.cur.send(msg); }
+  // 连接“假死”（Wi-Fi 闪断后浏览器还以为连着）：立刻换一条新连接，不等浏览器 30 秒后才发现
+  kick() {
+    const old = this.cur, next = new old.constructor(this.code, this.helloFn);
+    old.close();
+    this.use(next);
+    this.dispatchEvent(new CustomEvent('status', { detail: 'lost' }));
+    this.armFallback();
+  }
 }
