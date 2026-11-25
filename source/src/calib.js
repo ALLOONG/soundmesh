@@ -56,11 +56,13 @@ export class MicRecorder {
     this.node = new AudioWorkletNode(this.ctx, 'sm-rec', { channelCount: 1, channelCountMode: 'explicit' });
     const mute = this.ctx.createGain(); mute.gain.value = 0;
     this.src.connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
-    this.chunks = []; this.startHost = null; this.firstEnd = null;
+    this.chunks = []; this.startHost = null; this.pairs = [];
     this.node.port.onmessage = (e) => {
       const { end, data } = e.data;
-      // 用第一段建立“录音样本号 -> 控制端时钟”的对应关系（输入端固定延迟对所有设备相同，会在比较中抵消）
-      if (this.startHost === null) { this.startHost = this.clockNow() - (end / this.ctx.sampleRate) * 1000; }
+      // 每收到一段都记下“录到第几个采样点 ↔ 当时的控制端时间”，结束时用全部数据拟合（见 stop）
+      const now = this.clockNow();
+      if (this.startHost === null) this.startHost = now - (end / this.ctx.sampleRate) * 1000;
+      this.pairs.push([end, now]);
       this.chunks.push(data);
     };
   }
@@ -69,7 +71,27 @@ export class MicRecorder {
     this.stream.getTracks().forEach((t) => t.stop());
     const n = this.chunks.reduce((a, c) => a + c.length, 0), rec = new Float32Array(n);
     let o = 0; for (const c of this.chunks) { rec.set(c, o); o += c.length; }
-    const res = { rec, sr: this.ctx.sampleRate, startHost: this.startHost, inLat: this.inLat || 0 };
+    // 用整段录音拟合“采样点 → 时间”：斜率修正录音设备声卡时钟的快慢（十几秒可差约 1ms），
+    // 截距取下包络（网页忙时消息只会晚到、不会早到），不再受第一段消息偶尔晚到的影响
+    const sr = this.ctx.sampleRate, P = this.pairs, nominal = 1000 / sr;
+    let startHost = this.startHost, out = rec;
+    if (P.length >= 8) {
+      // 每 1 秒只取“延迟最小”的那个点（消息只会晚到，最早到的那个最接近真实），再用这些点拟合直线
+      const bins = new Map();
+      for (const p of P) { const k = Math.floor(p[0] / sr); const q = bins.get(k); if (!q || p[1] - nominal * p[0] < q[1] - nominal * q[0]) bins.set(k, p); }
+      const Q = bins.size >= 4 ? [...bins.values()] : P;
+      const mx = Q.reduce((a, p) => a + p[0], 0) / Q.length, my = Q.reduce((a, p) => a + p[1], 0) / Q.length;
+      let sxx = 0, sxy = 0; for (const [x, y] of Q) { sxx += (x - mx) ** 2; sxy += (x - mx) * (y - my); }
+      let b = sxx ? sxy / sxx : nominal;
+      const ratio = Math.min(1.0005, Math.max(0.9995, b / nominal)); b = nominal * ratio;
+      startHost = Math.min(...P.map(([x, y]) => y - b * x));
+      if (Math.abs(ratio - 1) > 2e-6) { // 重采样成“每个采样点正好 1/sr 秒（控制端时间）”
+        // 第 j 个输出点 = 时间 startHost + j/sr → 原录音第 j/ratio 个采样点
+        const m = Math.floor((rec.length - 1) * ratio); out = new Float32Array(m);
+        for (let j = 0; j < m; j++) { const p = j / ratio, i = Math.floor(p), t = p - i; out[j] = rec[i] * (1 - t) + rec[i + 1] * t; }
+      }
+    }
+    const res = { rec: out, sr, startHost, inLat: this.inLat || 0 };
     return typeof window !== 'undefined' && window.__smFakeMic ? window.__smFakeMic(res) : res; // 自动测试用（平时不存在）
   }
 }

@@ -805,10 +805,9 @@ const host = {
     };
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
-    $('#calibBtn').onclick = () => this.calibrate();
+    $('#calibBtn').onclick = () => this.smartCalibrate();
     $('#profileBtn').onclick = () => this.profileDevices();
     $('#bandGlue').oninput = (e) => { H.bandGlue = Number(e.target.value) / 100; $('#bandGlueVal').textContent = e.target.value + '%'; this.changed(); };
-    $('#musicCalBtn').onclick = () => this.musicCalibrate();
     $('#checkBtn').onclick = () => this.checkAssign();
     $('#lySearch').onclick = () => this.lySearch();
     $('#lyQ').onkeydown = (e) => e.key === 'Enter' && this.lySearch();
@@ -1072,7 +1071,7 @@ const host = {
     const rate = 24000, pm = this.plans();
     const known = (d) => (Number.isFinite(d.realLat) ? d.realLat : 0);
     const mic = await this.openMic(micId); // 先把麦克风打开（手机可能要一两秒），再安排各设备的出声时段
-    const LEN = 1900, GAP = 350, T0 = hostNow() + 1000;
+    const LEN = 1500, GAP = 300, T0 = hostNow() + 1000;
     const wins = devs.map((d, i) => {
       const from = T0 + i * (LEN + GAP), to = from + LEN, k = known(d);
       return { d, did: d.id, from, to, a: from + k + 300, b: to + k - 60, expect: H.liveDelay + this.totalD(d, pm) + k };
@@ -1122,9 +1121,10 @@ const host = {
     // 音乐有固定节拍，搜索范围太大可能对到“差一拍”的位置：没校准过的设备先用“啾”声粗测，音乐只在很小的范围里精确对齐
     if (devs.some((d) => !Number.isFinite(d.realLat))) {
       out('先用“啾”声粗测一次各设备的延迟…');
-      await this.calibrate();
+      await this.calibrate({ rounds: 3, verify: false });
       if (devs.some((d) => !Number.isFinite(d.realLat))) return; // 粗测没成功（结果已经显示了原因）
     }
+    this.calibPrep();
     this.calibrating = true; for (const b of ['#calibBtn', '#musicCalBtn', '#checkBtn']) $(b) && ($(b).disabled = true);
     const r1 = (v) => Math.round(v * 10) / 10;
     try {
@@ -1137,12 +1137,23 @@ const host = {
       for (const r of good) r.real = r.val - this.totalD(r.d, pm); // 这台设备真实的延迟（浏览器不知道的那部分）
       // 让每台设备在你的位置同时出声：以最慢的为准，其他设备等它（微调都 ≥ 0）
       const C = Math.max(...good.map((r) => (pm[r.d.id]?.delayMs || 0) + r.real));
-      for (const r of good) { r.d.realLat = r1(r.real); r.d.latencyMs = Math.max(0, Math.min(1000, r1(C - (pm[r.d.id]?.delayMs || 0) - r.real))); }
+      let maxChange = 0;
+      for (const r of good) {
+        const nl = Math.max(0, Math.min(1000, r1(C - (pm[r.d.id]?.delayMs || 0) - r.real)));
+        // 和现在的差（扣掉大家一起平移的部分）：都很小就不用再验证一轮，省时间
+        r.change = nl - r.d.latencyMs; r.d.realLat = r1(r.real); r.d.latencyMs = nl;
+      }
+      const meanChange = good.reduce((a, r) => a + r.change, 0) / good.length;
+      maxChange = Math.max(...good.map((r) => Math.abs(r.change - meanChange)));
       this.changed(); this.lastWire = ''; this.publish();
-      await sleep(2500); // 等新设置生效、设备追上
-      // 第 2 步：再测一次，确认误差；还差的再修一次
-      const chk = await this.musicPass(good.map((r) => r.d), micId, 25, out, '第 2 步：验证');
+      let chk = [];
+      if (maxChange > 1) {
+        await sleep(2500); // 等新设置生效、设备追上
+        // 第 2 步：改动比较大，再测一次确认；还差的再修一次
+        chk = await this.musicPass(good.map((r) => r.d), micId, 25, out, '第 2 步：验证');
+      } else for (const r of good) { r.resid = r.change - meanChange; r.noVerify = true; } // 本来就差不多齐：这次的修正量就是原本的误差
       const cg = chk.filter((r) => r.ok);
+      if (!chk.length) { /* 没有第 2 轮 */ }
       for (const c of cg) {
         const row = rows.find((r) => r.d === c.d);
         row.resid = c.val - median(cg.map((x) => x.val));
@@ -1154,10 +1165,11 @@ const host = {
       const worst = Math.max(0, ...verified.map((r) => Math.abs(r.resid)));
       const others = rows.filter((r) => r.other && r.other.ratio > 0.6 && Math.abs(r.other.ms) > 3);
       const pcCopy = this.earlyCopy;
-      out(`✅ 用音乐校准完成${verified.length ? `：播放音乐时各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>` : ''}${rows.some((r) => r.fixed) ? '（个别设备已再修正，想确认可以再按一次）' : ''}
+      const nv = rows.some((r) => r.noVerify);
+      out(`✅ 用音乐校准完成${nv ? `：校准前各设备之间最多差 <b>${worst.toFixed(1)} ms</b>，已经修正（差得不多，所以没有再验证一轮）` : verified.length ? `：播放音乐时各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>` : ''}${rows.some((r) => r.fixed) ? '（个别设备已再修正，想确认可以再按一次）' : ''}
         <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td>
           <td>${r.ok ? `真实延迟 ${r.real.toFixed(1)} ms` : `<span style="color:var(--bad)">没比对成功</span><div class="muted">${r.quiet ? '这段时间几乎没声音：换一段一直有声音的歌' : this.chirpWhy(r.d).replace('测试音', '音乐')}</div>`}</td>
-          <td>${r.resid === undefined ? (r.ok ? '验证没比对成功' : '未调整') : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms`}</td>
+          <td>${r.resid === undefined ? (r.ok ? '验证没比对成功' : '未调整') : r.noVerify ? `原本差 ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms → 已修正` : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms`}</td>
           <td class="muted">微调 → ${r.d.latencyMs} ms</td></tr>`).join('')}</table>
         ${pcCopy !== null && pcCopy !== undefined ? `<div style="color:var(--bad);margin-top:6px">⚠️ <b>还听到一份不经过 SoundMesh 的同一首歌</b>（几乎没有延迟，比所有设备早了好几百毫秒）。这通常是<b>电脑自己在放原声</b>：共享“整个屏幕”时电脑不会静音。它会和其他设备形成回音，校准也救不了——请改成共享 YouTube Music 那个<b>分页</b>（会自动静音），或把电脑的系统音量关掉。</div>` : ''}
         ${others.length ? `<div style="color:var(--warn,#f59f00);margin-top:4px">⚠️ 在 ${others.map((r) => esc(r.d.name)).join('、')} 单独出声的时候，还听到另一份同样的音乐（${others.map((r) => `${r.other.ms < 0 ? '早' : '晚'} ${Math.abs(r.other.ms).toFixed(0)} ms`).join('、')}）。通常是<b>电脑本身还在放原声</b>（共享整个屏幕时会这样）或有其他设备在放同一首歌——它不受 SoundMesh 控制，会听起来像回音。建议改成共享 YouTube 那个分页，或把电脑音量关掉。</div>` : ''}`);
@@ -1170,8 +1182,19 @@ const host = {
     }
   },
 
-  async calibrate() {
+  // 一个按钮：有音乐在播就用音乐校准（最准，测的就是你听到的），没有就用“啾”声
+  async smartCalibrate() {
+    if (this.group()?.kind === 'live' && this.live.running) return this.musicCalibrate();
+    return this.calibrate();
+  },
+  // 校准时测的是真实距离：关掉“按画布距离补偿延迟”，以后在画布上拖动设备也不会打乱同步
+  calibPrep() {
+    if (H.options?.distanceDelay) { H.options.distanceDelay = false; toast('已关闭“按距离补偿延迟”：校准按实际测量对齐，之后在画布上拖动设备不会打乱同步'); this.changed(); }
+  },
+
+  async calibrate({ rounds = 4, verify = true } = {}) {
     if (this.calibrating) return;
+    this.calibPrep();
     const out = (h) => ($('#calibOut').innerHTML = h);
     const micId = $('#calibMic').value;
     const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
@@ -1185,7 +1208,7 @@ const host = {
       const hiddenDevs = devs.filter((d) => d.id !== 'self' && d.stats?.hidden);
       if (hiddenDevs.length) toast(`⚠️ ${hiddenDevs.map((d) => d.name).join('、')} 的 SoundMesh 在后台，可能播不出测试音：请把它切回前台、亮着屏幕`);
       // 第 1 步：每台设备“啾”5 轮。不套用以前的延迟微调，直接量出每台设备真实的延迟
-      const rows = await this.measureChirps(devs, micId, 5, out, '第 1 步：测量各设备真实的延迟', true);
+      const rows = await this.measureChirps(devs, micId, rounds, out, verify ? '第 1 步：测量各设备真实的延迟' : '粗测各设备的延迟', true);
       const plans0 = this.plans();
       for (const r of rows) r.e = r.val === null ? null : r.val - (plans0[r.d.id]?.delayMs || 0); // 扣掉按位置故意加的延迟
       const valid = rows.filter((r) => r.e !== null);
@@ -1193,12 +1216,12 @@ const host = {
       // 以最慢的那台为准：其他设备等它（延迟微调都是 0 或正数）。这样没有设备需要“提前播”，缓冲可以压到最低
       const slowest = Math.max(...valid.map((r) => r.e));
       this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
-      for (const r of valid) { r.first = r.e; r.d.latencyMs = Math.max(0, Math.min(1000, r1(slowest - r.e))); }
+      for (const r of valid) { r.first = r.e; r.d.realLat = r1(r.e); r.d.latencyMs = Math.max(0, Math.min(1000, r1(slowest - r.e))); }
       const ref = 0;
       this.changed(); this.lastWire = ''; this.publish();
       await sleep(1500); // 等新设置传到每台设备
-      // 第 2 步：再测 3 轮验证；还有超过 0.3ms 的偏差就再修正一次
-      const check = await this.measureChirps(valid.map((r) => r.d), micId, 3, out, '第 2 步：验证校准结果');
+      // 第 2 步：再测 2 轮验证；还有超过 0.3ms 的偏差就再修正一次（粗测时跳过）
+      const check = verify ? await this.measureChirps(valid.map((r) => r.d), micId, 2, out, '第 2 步：验证校准结果') : valid.map((r) => ({ d: r.d, val: null }));
       const cv = check.filter((r) => r.val !== null), ref2 = cv.length ? median(cv.map((r) => r.val)) : 0;
       // 顺便算出“声音真正到你耳朵比预定晚多少”（手机喇叭/蓝牙的真实延迟，浏览器报的数字常常不准），
       // 看视频时画面就按这个自动延后，不用手动微调
