@@ -1,5 +1,6 @@
 // 播放引擎：解码/合成音频、把“控制端时钟”换算成 AudioContext 时间、精确调度、漂移修正
 import { synthBuffer } from './synth.js';
+import { makeSweep } from './calib.js';
 import { makeChirp } from './calib.js';
 
 const DRIFT_LIMIT_MS = 35;
@@ -225,6 +226,20 @@ export class Engine extends EventTarget {
     g.setTargetAtTime(plan, c(from), 0.05);
     g.setTargetAtTime(0, c(to), 0.05);
     g.setTargetAtTime(plan, c(end), 0.1);
+  }
+
+  // 测设备特长用的扫频：不经过音量（测的是设备本身能放出什么）
+  playSweepAt(at) {
+    if (!this.unlocked || this.ctx.state !== 'running') return false;
+    if (!this.sweepBuf) {
+      const c = makeSweep(this.ctx.sampleRate);
+      this.sweepBuf = this.ctx.createBuffer(1, c.length, this.ctx.sampleRate);
+      this.sweepBuf.copyToChannel(c, 0);
+    }
+    const when = this.clockToCtx(at);
+    if (when < this.ctx.currentTime + 0.01) return false;
+    const s = this.ctx.createBufferSource(); s.buffer = this.sweepBuf; s.connect(this.master); s.start(this.at(when));
+    return true;
   }
 
   // 校准用：在控制端时间 at（再加本机当前的总延迟，和放音乐时一样）播放一声“啾”

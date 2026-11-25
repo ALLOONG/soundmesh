@@ -4,7 +4,7 @@
 //   人声 = 中频段里“左右声道一模一样”的部分（人声通常混在正中间），且不是打击声
 //   鼓   = 谐波/打击分离（HPSS）里“打击”的部分
 //   伴奏 = 其余全部
-// 四条加起来 ≈ 原曲的单声道混音。
+// 每条都是立体声（同一个分离结果分别套在左、右声道上），四条加起来 = 原曲（完整重建，不丢东西）。
 
 export class FFT {
   constructor(n) {
@@ -55,9 +55,9 @@ export class Separator {
     this.prevVm = new Float64Array(K);
     this.in = { L: new Float32Array(0), R: new Float32Array(0), start: null };
     this.nextFrame = null;
-    this.acc = Object.fromEntries(STEMS.map((s) => [s, new Float64Array(N * 2)]));
+    this.acc = Object.fromEntries(STEMS.map((s) => [s, [new Float64Array(N * 2), new Float64Array(N * 2)]]));
     this.accStart = null;
-    this.pend = Object.fromEntries(STEMS.map((s) => [s, []]));
+    this.pend = Object.fromEntries(STEMS.map((s) => [s, [[], []]]));
     this.pendStart = null;
     this.tmp = { re: new Float64Array(N), im: new Float64Array(N) };
     this.median = new Float64Array(Math.max(this.T, this.F));
@@ -99,7 +99,7 @@ export class Separator {
       Vm[k] = 0.5 * v + 0.5 * this.prevVm[k]; // 时间上平滑，减少“水声”
       this.prevVm[k] = v;
     }
-    this.hist.push({ Mre, Mim, mag, Vm, pos });
+    this.hist.push({ Mre, Mim, mag, Vm, pos, lr, li, rr, ri });
     if (this.hist.length < this.T) return;
     if (this.hist.length > this.T) this.hist.shift();
     this.emitCenter(out);
@@ -110,7 +110,8 @@ export class Separator {
     const c = hist[(T - 1) / 2];
     const med = this.median;
     const spec = {};
-    for (const s of STEMS) spec[s] = { re: new Float64Array(N), im: new Float64Array(N) };
+    for (const s of STEMS) spec[s] = [0, 1].map(() => ({ re: new Float64Array(N), im: new Float64Array(N) }));
+    const chans = [[c.lr, c.li], [c.rr, c.ri]];
     for (let k = 0; k < K; k++) {
       // 谐波 = 时间方向中位数（持续的音），打击 = 频率方向中位数（瞬间的宽频冲击）
       for (let t = 0; t < T; t++) med[t] = hist[t].mag[k];
@@ -127,31 +128,31 @@ export class Separator {
         vocals: (1 - Bm) * (1 - Pm) * Vm,
         other: (1 - Bm) * (1 - Pm) * (1 - Vm),
       };
-      for (const s of STEMS) {
-        const sp = spec[s];
-        sp.re[k] = c.Mre[k] * g[s]; sp.im[k] = c.Mim[k] * g[s];
+      for (const s of STEMS) for (let ch = 0; ch < 2; ch++) {
+        const sp = spec[s][ch], [cr, ci] = chans[ch];
+        sp.re[k] = cr[k] * g[s]; sp.im[k] = ci[k] * g[s];
         if (k > 0 && k < N / 2) { sp.re[N - k] = sp.re[k]; sp.im[N - k] = -sp.im[k]; }
       }
     }
     if (this.accStart === null) { this.accStart = c.pos; this.pendStart = c.pos; }
     const off = c.pos - this.accStart;
-    for (const s of STEMS) {
-      const { re, im } = spec[s];
+    for (const s of STEMS) for (let ch = 0; ch < 2; ch++) {
+      const { re, im } = spec[s][ch];
       this.fft.run(re, im, true);
-      const acc = this.acc[s];
+      const acc = this.acc[s][ch];
       for (let i = 0; i < N; i++) acc[off + i] += re[i] * this.win[i];
     }
     // c.pos 之前加上一个 hop 的样本已经叠加完毕，可以输出
     const done = off + this.H;
-    for (const s of STEMS) {
-      const acc = this.acc[s];
-      for (let i = 0; i < done; i++) this.pend[s].push(acc[i]);
+    for (const s of STEMS) for (let ch = 0; ch < 2; ch++) {
+      const acc = this.acc[s][ch];
+      for (let i = 0; i < done; i++) this.pend[s][ch].push(acc[i]);
       acc.copyWithin(0, done); acc.fill(0, acc.length - done);
     }
     this.accStart += done;
-    while (this.pend.vocals.length >= this.outChunk) {
+    while (this.pend.vocals[0].length >= this.outChunk) {
       const stems = {};
-      for (const s of STEMS) stems[s] = Float32Array.from(this.pend[s].splice(0, this.outChunk));
+      for (const s of STEMS) stems[s] = [0, 1].map((ch) => Float32Array.from(this.pend[s][ch].splice(0, this.outChunk)));
       out.push({ frame: this.pendStart, stems });
       this.pendStart += this.outChunk;
     }

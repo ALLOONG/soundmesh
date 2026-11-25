@@ -191,6 +191,61 @@ export function splitKind(room, group) {
 
 // ---------- 主函数 ----------
 
+// ---------- 乐团模式 ----------
+// 设备特长：测过就用测的；没测过按设备类型估（手机小喇叭低音最少，电脑/平板好一些）
+export function capOf(d) {
+  if (d.cap?.measured) return d.cap;
+  const t = { phone: { low: 350, high: 14000, bass: -18 }, tablet: { low: 180, high: 15000, bass: -10 }, computer: { low: 110, high: 16000, bass: -6 } }[d.type] || { low: 180, high: 15000, bass: -10 };
+  return d.caps?.bass ? { ...t, low: 60, bass: 0 } : t;
+}
+export const BAND_PARTS = { vocals: '🎤 人声', drums: '🥁 鼓', bass: '🎸 低音', other: '🎹 伴奏' };
+
+// 每个声部分给哪些设备、各占多少：
+//   低音 → 低音最足的设备（几乎全给它）
+//   人声 → 正前方/中间的设备（像主唱站在中间）
+//   伴奏 → 左右两边的设备（拉开宽度）
+//   鼓   → 低音和高音都不错、靠中间的设备
+// 每个声部在所有设备上的份量加起来正好 = 1，所以大家合起来就是完整的原曲，不会“分开”；
+// “融合度”再让每台都带一点完整的歌，听起来更像一个整体。
+export function bandWeights(room, devs, geo) {
+  const out = new Map();
+  if (!devs.length) return out;
+  const caps = devs.map((d) => capOf(d));
+  const bassFit = caps.map((c) => clamp((420 - c.low) / 360, 0.03, 1));
+  const trebFit = caps.map((c) => clamp((c.high - 6000) / 10000, 0.2, 1));
+  const bMax = Math.max(...bassFit), tMax = Math.max(...trebFit);
+  const near = (az, center, width) => Math.exp(-(((angleDiff(az, center)) / width) ** 2));
+  const raw = { vocals: [], drums: [], bass: [], other: [] };
+  devs.forEach((d, i) => {
+    const az = geo[d.id].az, b = bassFit[i] / bMax, t = trebFit[i] / tMax;
+    raw.bass.push(b ** 4);
+    raw.vocals.push(near(az, 0, 20) * (0.4 + 0.6 * t) + 0.02);
+    raw.drums.push(((b + t) / 2) ** 2 * (0.5 + 0.5 * near(az, 0, 60)) + 0.02);
+    raw.other.push((0.25 + 0.75 * Math.min(1, Math.abs(az) / 50)) * (0.5 + 0.5 * t) + 0.02);
+  });
+  const g = devs.length === 1 ? 1 : clamp(room.bandGlue ?? 0.25, 0, 1);
+  const w = {};
+  for (const part of Object.keys(raw)) {
+    const sum = raw[part].reduce((a, v) => a + v, 0) || 1;
+    w[part] = raw[part].map((v) => (1 - g) * (v / sum) + g / devs.length);
+  }
+  // 立体声也按位置分：左边的设备多放左声道、右边的多放右声道（像乐手站在舞台左右）。
+  // 每个声部的左声道在所有设备上加起来 = 1，右声道也是 = 1 → 合起来仍是完整的原曲
+  const spread = clamp(room.bandSpread ?? 0.8, 0, 1);
+  const pans = devs.map((d) => geo[d.id].pan);
+  const lr = {};
+  for (const part of Object.keys(w)) {
+    const l = w[part].map((v, i) => v * (1 - spread * pans[i])), r = w[part].map((v, i) => v * (1 + spread * pans[i]));
+    const sl = l.reduce((a, v) => a + v, 0) || 1, sr = r.reduce((a, v) => a + v, 0) || 1;
+    lr[part] = devs.map((_, i) => [l[i] / sl, r[i] / sr]);
+  }
+  devs.forEach((d, i) => out.set(d.id, {
+    vocals: w.vocals[i], drums: w.drums[i], bass: w.bass[i], other: w.other[i],
+    lr: { vocals: lr.vocals[i], drums: lr.drums[i], bass: lr.bass[i], other: lr.other[i] },
+  }));
+  return out;
+}
+
 export function computeMix(room) {
   const plans = {};
   const group = room.library.find((g) => g.id === room.currentGroupId) || null;
@@ -218,6 +273,7 @@ export function computeMix(room) {
   }
 
   // 2) 分配声源
+  const band = group?.kind === 'live' && room.mode === 'band' ? bandWeights(room, devs, geo) : null;
   let autoAssign = new Map();
   let split = null;
   const manual = {};
@@ -243,7 +299,12 @@ export function computeMix(room) {
     let assign = [];
 
     if (group) {
-      if (room.mode !== 'split') {
+      if (band) {
+        // 乐团模式：控制端已经按这台设备的角色混好一份专属的声音（每台不一样）
+        const bt = group.tracks.find((t) => t.role === 'band');
+        if (bt) sources = [{ trackId: bt.id, mix: { type: 'stereo' }, filters: [] }]; // 左右已经在控制端按位置分好了
+        assign = ['band'];
+      } else if (room.mode !== 'split') {
         // 协同播放：所有轨道一起出
         sources = mixTracks(group).map((t) => ({ trackId: t.id, mix: stereoMix, filters: [] }));
         assign = ['all'];
@@ -275,6 +336,7 @@ export function computeMix(room) {
       split,
       assign,
       sources,
+      band: band ? band.get(d.id) : null,
     };
   }
   return plans;
@@ -283,6 +345,7 @@ export function computeMix(room) {
 // 把分配 key 转成人能看懂的标签
 export function assignLabel(room, key) {
   if (key === 'all') return '全部';
+  if (key === 'band') return '乐团角色';
   const group = room.library.find((g) => g.id === room.currentGroupId);
   const [kind, val] = key.split(':');
   if (kind === 'track') return group?.tracks.find((t) => t.id === val)?.name || '轨道';

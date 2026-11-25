@@ -167,6 +167,15 @@
         <div class="seg" id="modeSeg">
           <button data-mode="sync">a) 协同播放</button>
           <button data-mode="split">b) 声音分工</button>
+          <button data-mode="band">c) 🎼 乐团</button>
+        </div>
+        <div id="bandBox" class="stack small" style="display:none">
+          <div class="muted">🎼 <b>乐团模式</b>：像一个乐团，每台设备负责自己最擅长的部分——低音最足的放贝斯和低音，中间的放人声，左右两边放伴奏拉开宽度。每个声部在所有设备上加起来正好是完整的原曲，所以听起来是<b>一首完整的歌</b>，只是声音从各个方向、由最合适的设备发出来。（用于“实时音源”，先“开始校准”效果最好）</div>
+          <div class="row"><span>融合度</span><input type="range" id="bandGlue" min="0" max="100" step="5" class="grow" style="width:auto" /><b id="bandGlueVal"></b></div>
+          <div class="muted" style="margin-top:-6px">越低 = 每台越专注自己的部分（分工明显）；越高 = 每台都多带一点完整的歌（更融合）</div>
+          <div class="row"><button id="profileBtn">🎸 测各设备特长</button><span class="muted">（每台轮流播 2 秒扫频，测能放多低、多高；不测就按设备类型估计）</span></div>
+          <div id="bandOut"></div>
+          <div id="bandRoles"></div>
         </div>
         <div class="stack small">
           <label><input type="checkbox" data-opt="distanceGain" /> 按距离补偿音量</label>

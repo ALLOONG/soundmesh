@@ -248,3 +248,87 @@ export function findEarlyCopy(mic, a, b, lagFrom, lagTo, getSrc, rate) {
   const g = gccPhat(y, x, Math.round(((lagTo - lagFrom) / 1000) * rate), rate);
   return { found: g.clarity > 10, lagMs: lagTo - (g.lag / rate) * 1000, clarity: g.clarity };
 }
+
+// ---------- 测设备特长：扫频测每台设备能放多低、多高（只用来分配角色，不改音色） ----------
+export const SWEEP_SEC = 2.0;
+
+// 对数扫频 30Hz → 20kHz（每个八度停留时间相同，低音也测得准）
+export function makeSweep(sr, amp = 0.5) {
+  const n = Math.round(sr * SWEEP_SEC), out = new Float32Array(n);
+  const f0 = 30, f1 = Math.min(20000, sr * 0.45), T = SWEEP_SEC, K = Math.log(f1 / f0);
+  const fade = Math.round(sr * 0.04);
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const ph = (2 * Math.PI * f0 * T / K) * (Math.exp((t / T) * K) - 1);
+    const w = i < fade ? i / fade : i > n - fade ? (n - i) / fade : 1;
+    out[i] = Math.sin(ph) * w * amp;
+  }
+  return out;
+}
+
+// 1/3 倍频程频带（25Hz–16kHz）
+export const THIRD_OCT = (() => { const a = []; for (let k = -16; k <= 13; k++) a.push(1000 * 2 ** (k / 3)); return a; })();
+
+// 一段信号的“能量谱”（Welch 平均，N 点，50% 重叠，汇总成每个频点的能量）
+function energySpectrum(sig, a, b, fft, N, hann) {
+  const out = new Float64Array(N / 2), re = new Float64Array(N), im = new Float64Array(N);
+  for (let s = a; s < b; s += hann[0] === 1 ? N : N / 2) {
+    for (let i = 0; i < N; i++) { const j = s + i, v = j < b && j >= 0 && j < sig.length ? sig[j] : 0; re[i] = v * hann[i]; im[i] = 0; }
+    fft.run(re, im, false);
+    for (let k = 0; k < N / 2; k++) out[k] += re[k] * re[k] + im[k] * im[k];
+  }
+  return out;
+}
+
+// windows: [{ did, at }]（扫频开始的控制端时间）；noise: { from, to }
+// 返回每台设备在 1/3 倍频程各频带的响应（dB，相对值）和该频带是否听得清
+export function analyzeResponse({ rec, sr, startHost }, windows, noise) {
+  // 整段一次 FFT（扫频完整落在这段里，前后都是静音），每个频率被计入的分量完全一样，不会因为时间位置而偏差
+  const idx = (t) => Math.round(((t - startHost) / 1000) * sr);
+  const len = Math.round((SWEEP_SEC + 0.55) * sr); // 扫频长度 + 设备输出延迟/房间余响的余量
+  let N = 1; while (N < len) N <<= 1;
+  const fft = new FFT(N), ones = new Float64Array(N).fill(1);
+  const whole = (sig, a, b) => energySpectrum(sig, a, b, fft, N, ones);
+  const X = whole(makeSweep(sr), 0, len);
+  // 底噪：用较短的一段估算，换算到同样长度
+  const Nw = 8192, fftN = new FFT(Nw), hann = new Float64Array(Nw);
+  for (let i = 0; i < Nw; i++) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Nw);
+  const na = Math.max(0, idx(noise.from)), nb = Math.min(rec.length, idx(noise.to));
+  const Nn0 = energySpectrum(rec, na, nb, fftN, Nw, hann), segs = Math.max(1, Math.ceil((nb - na) / (Nw / 2)));
+  const Nn = new Float64Array(N / 2), ratio = N / Nw;
+  for (let k = 0; k < N / 2; k++) Nn[k] = (Nn0[Math.min(Nw / 2 - 1, Math.floor(k / ratio))] / segs / 0.375) * (len / Nw) / ratio;
+  const nScale = 1;
+  const binHz = sr / N;
+  return windows.map((w) => {
+    const a = Math.max(0, idx(w.at) - Math.round(0.05 * sr));
+    const Y = whole(rec, a, Math.min(rec.length, a + len));
+    const bands = THIRD_OCT.map((fc) => {
+      const lo = fc / 2 ** (1 / 6), hi = fc * 2 ** (1 / 6);
+      let y = 0, x = 0, nz = 0;
+      for (let k = Math.max(1, Math.floor(lo / binHz)); k <= Math.ceil(hi / binHz) && k < N / 2; k++) { y += Y[k]; x += X[k]; nz += Nn[k] * nScale; }
+      const sig = Math.max(y - nz, 1e-20);
+      return { f: fc, db: 10 * Math.log10(sig / Math.max(x, 1e-20)), snr: 10 * Math.log10((y + 1e-20) / (nz + 1e-20)) };
+    });
+    return { did: w.did, bands };
+  });
+}
+
+
+// 从扫频结果算出这台设备的“特长”：能放到多低（低于中频 10dB 的位置）、多高、低音有多足
+// （录音设备的麦克风本身也有偏差，但所有设备用同一个麦克风测，互相比较是准的）
+export function profileFromBands(bands) {
+  const ok = bands.filter((b) => b.snr > 6);
+  const midB = ok.filter((b) => b.f >= 400 && b.f <= 2500);
+  if (midB.length < 3) return null;
+  const mid = midB.reduce((a, b) => a + b.db, 0) / midB.length;
+  const lowOk = ok.filter((b) => b.f <= 400 && b.db >= mid - 10).map((b) => b.f);
+  const highOk = ok.filter((b) => b.f >= 4000 && b.db >= mid - 12).map((b) => b.f);
+  const bassB = ok.filter((b) => b.f >= 50 && b.f <= 160);
+  return {
+    low: Math.round(lowOk.length ? Math.min(...lowOk) : 400),
+    high: Math.round(highOk.length ? Math.max(...highOk) : 4000),
+    bass: bassB.length ? Math.round((bassB.reduce((a, b) => a + b.db, 0) / bassB.length - mid) * 10) / 10 : -30,
+    level: Math.round(mid * 10) / 10,
+    measured: true,
+  };
+}

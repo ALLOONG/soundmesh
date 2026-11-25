@@ -323,6 +323,15 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         <div class="seg" id="modeSeg">
           <button data-mode="sync">a) 协同播放</button>
           <button data-mode="split">b) 声音分工</button>
+          <button data-mode="band">c) 🎼 乐团</button>
+        </div>
+        <div id="bandBox" class="stack small" style="display:none">
+          <div class="muted">🎼 <b>乐团模式</b>：像一个乐团，每台设备负责自己最擅长的部分——低音最足的放贝斯和低音，中间的放人声，左右两边放伴奏拉开宽度。每个声部在所有设备上加起来正好是完整的原曲，所以听起来是<b>一首完整的歌</b>，只是声音从各个方向、由最合适的设备发出来。（用于“实时音源”，先“开始校准”效果最好）</div>
+          <div class="row"><span>融合度</span><input type="range" id="bandGlue" min="0" max="100" step="5" class="grow" style="width:auto" /><b id="bandGlueVal"></b></div>
+          <div class="muted" style="margin-top:-6px">越低 = 每台越专注自己的部分（分工明显）；越高 = 每台都多带一点完整的歌（更融合）</div>
+          <div class="row"><button id="profileBtn">🎸 测各设备特长</button><span class="muted">（每台轮流播 2 秒扫频，测能放多低、多高；不测就按设备类型估计）</span></div>
+          <div id="bandOut"></div>
+          <div id="bandRoles"></div>
         </div>
         <div class="stack small">
           <label><input type="checkbox" data-opt="distanceGain" /> 按距离补偿音量</label>
@@ -2926,6 +2935,61 @@ function splitKind(room, group) {
 
 // ---------- 主函数 ----------
 
+// ---------- 乐团模式 ----------
+// 设备特长：测过就用测的；没测过按设备类型估（手机小喇叭低音最少，电脑/平板好一些）
+function capOf(d) {
+  if (d.cap?.measured) return d.cap;
+  const t = { phone: { low: 350, high: 14000, bass: -18 }, tablet: { low: 180, high: 15000, bass: -10 }, computer: { low: 110, high: 16000, bass: -6 } }[d.type] || { low: 180, high: 15000, bass: -10 };
+  return d.caps?.bass ? { ...t, low: 60, bass: 0 } : t;
+}
+const BAND_PARTS = { vocals: '🎤 人声', drums: '🥁 鼓', bass: '🎸 低音', other: '🎹 伴奏' };
+
+// 每个声部分给哪些设备、各占多少：
+//   低音 → 低音最足的设备（几乎全给它）
+//   人声 → 正前方/中间的设备（像主唱站在中间）
+//   伴奏 → 左右两边的设备（拉开宽度）
+//   鼓   → 低音和高音都不错、靠中间的设备
+// 每个声部在所有设备上的份量加起来正好 = 1，所以大家合起来就是完整的原曲，不会“分开”；
+// “融合度”再让每台都带一点完整的歌，听起来更像一个整体。
+function bandWeights(room, devs, geo) {
+  const out = new Map();
+  if (!devs.length) return out;
+  const caps = devs.map((d) => capOf(d));
+  const bassFit = caps.map((c) => clamp((420 - c.low) / 360, 0.03, 1));
+  const trebFit = caps.map((c) => clamp((c.high - 6000) / 10000, 0.2, 1));
+  const bMax = Math.max(...bassFit), tMax = Math.max(...trebFit);
+  const near = (az, center, width) => Math.exp(-(((angleDiff(az, center)) / width) ** 2));
+  const raw = { vocals: [], drums: [], bass: [], other: [] };
+  devs.forEach((d, i) => {
+    const az = geo[d.id].az, b = bassFit[i] / bMax, t = trebFit[i] / tMax;
+    raw.bass.push(b ** 4);
+    raw.vocals.push(near(az, 0, 20) * (0.4 + 0.6 * t) + 0.02);
+    raw.drums.push(((b + t) / 2) ** 2 * (0.5 + 0.5 * near(az, 0, 60)) + 0.02);
+    raw.other.push((0.25 + 0.75 * Math.min(1, Math.abs(az) / 50)) * (0.5 + 0.5 * t) + 0.02);
+  });
+  const g = devs.length === 1 ? 1 : clamp(room.bandGlue ?? 0.25, 0, 1);
+  const w = {};
+  for (const part of Object.keys(raw)) {
+    const sum = raw[part].reduce((a, v) => a + v, 0) || 1;
+    w[part] = raw[part].map((v) => (1 - g) * (v / sum) + g / devs.length);
+  }
+  // 立体声也按位置分：左边的设备多放左声道、右边的多放右声道（像乐手站在舞台左右）。
+  // 每个声部的左声道在所有设备上加起来 = 1，右声道也是 = 1 → 合起来仍是完整的原曲
+  const spread = clamp(room.bandSpread ?? 0.8, 0, 1);
+  const pans = devs.map((d) => geo[d.id].pan);
+  const lr = {};
+  for (const part of Object.keys(w)) {
+    const l = w[part].map((v, i) => v * (1 - spread * pans[i])), r = w[part].map((v, i) => v * (1 + spread * pans[i]));
+    const sl = l.reduce((a, v) => a + v, 0) || 1, sr = r.reduce((a, v) => a + v, 0) || 1;
+    lr[part] = devs.map((_, i) => [l[i] / sl, r[i] / sr]);
+  }
+  devs.forEach((d, i) => out.set(d.id, {
+    vocals: w.vocals[i], drums: w.drums[i], bass: w.bass[i], other: w.other[i],
+    lr: { vocals: lr.vocals[i], drums: lr.drums[i], bass: lr.bass[i], other: lr.other[i] },
+  }));
+  return out;
+}
+
 function computeMix(room) {
   const plans = {};
   const group = room.library.find((g) => g.id === room.currentGroupId) || null;
@@ -2953,6 +3017,7 @@ function computeMix(room) {
   }
 
   // 2) 分配声源
+  const band = group?.kind === 'live' && room.mode === 'band' ? bandWeights(room, devs, geo) : null;
   let autoAssign = new Map();
   let split = null;
   const manual = {};
@@ -2978,7 +3043,12 @@ function computeMix(room) {
     let assign = [];
 
     if (group) {
-      if (room.mode !== 'split') {
+      if (band) {
+        // 乐团模式：控制端已经按这台设备的角色混好一份专属的声音（每台不一样）
+        const bt = group.tracks.find((t) => t.role === 'band');
+        if (bt) sources = [{ trackId: bt.id, mix: { type: 'stereo' }, filters: [] }]; // 左右已经在控制端按位置分好了
+        assign = ['band'];
+      } else if (room.mode !== 'split') {
         // 协同播放：所有轨道一起出
         sources = mixTracks(group).map((t) => ({ trackId: t.id, mix: stereoMix, filters: [] }));
         assign = ['all'];
@@ -3010,6 +3080,7 @@ function computeMix(room) {
       split,
       assign,
       sources,
+      band: band ? band.get(d.id) : null,
     };
   }
   return plans;
@@ -3018,6 +3089,7 @@ function computeMix(room) {
 // 把分配 key 转成人能看懂的标签
 function assignLabel(room, key) {
   if (key === 'all') return '全部';
+  if (key === 'band') return '乐团角色';
   const group = room.library.find((g) => g.id === room.currentGroupId);
   const [kind, val] = key.split(':');
   if (kind === 'track') return group?.tracks.find((t) => t.id === val)?.name || '轨道';
@@ -3443,6 +3515,90 @@ function findEarlyCopy(mic, a, b, lagFrom, lagTo, getSrc, rate) {
   return { found: g.clarity > 10, lagMs: lagTo - (g.lag / rate) * 1000, clarity: g.clarity };
 }
 
+// ---------- 测设备特长：扫频测每台设备能放多低、多高（只用来分配角色，不改音色） ----------
+const SWEEP_SEC = 2.0;
+
+// 对数扫频 30Hz → 20kHz（每个八度停留时间相同，低音也测得准）
+function makeSweep(sr, amp = 0.5) {
+  const n = Math.round(sr * SWEEP_SEC), out = new Float32Array(n);
+  const f0 = 30, f1 = Math.min(20000, sr * 0.45), T = SWEEP_SEC, K = Math.log(f1 / f0);
+  const fade = Math.round(sr * 0.04);
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const ph = (2 * Math.PI * f0 * T / K) * (Math.exp((t / T) * K) - 1);
+    const w = i < fade ? i / fade : i > n - fade ? (n - i) / fade : 1;
+    out[i] = Math.sin(ph) * w * amp;
+  }
+  return out;
+}
+
+// 1/3 倍频程频带（25Hz–16kHz）
+const THIRD_OCT = (() => { const a = []; for (let k = -16; k <= 13; k++) a.push(1000 * 2 ** (k / 3)); return a; })();
+
+// 一段信号的“能量谱”（Welch 平均，N 点，50% 重叠，汇总成每个频点的能量）
+function energySpectrum(sig, a, b, fft, N, hann) {
+  const out = new Float64Array(N / 2), re = new Float64Array(N), im = new Float64Array(N);
+  for (let s = a; s < b; s += hann[0] === 1 ? N : N / 2) {
+    for (let i = 0; i < N; i++) { const j = s + i, v = j < b && j >= 0 && j < sig.length ? sig[j] : 0; re[i] = v * hann[i]; im[i] = 0; }
+    fft.run(re, im, false);
+    for (let k = 0; k < N / 2; k++) out[k] += re[k] * re[k] + im[k] * im[k];
+  }
+  return out;
+}
+
+// windows: [{ did, at }]（扫频开始的控制端时间）；noise: { from, to }
+// 返回每台设备在 1/3 倍频程各频带的响应（dB，相对值）和该频带是否听得清
+function analyzeResponse({ rec, sr, startHost }, windows, noise) {
+  // 整段一次 FFT（扫频完整落在这段里，前后都是静音），每个频率被计入的分量完全一样，不会因为时间位置而偏差
+  const idx = (t) => Math.round(((t - startHost) / 1000) * sr);
+  const len = Math.round((SWEEP_SEC + 0.55) * sr); // 扫频长度 + 设备输出延迟/房间余响的余量
+  let N = 1; while (N < len) N <<= 1;
+  const fft = new FFT(N), ones = new Float64Array(N).fill(1);
+  const whole = (sig, a, b) => energySpectrum(sig, a, b, fft, N, ones);
+  const X = whole(makeSweep(sr), 0, len);
+  // 底噪：用较短的一段估算，换算到同样长度
+  const Nw = 8192, fftN = new FFT(Nw), hann = new Float64Array(Nw);
+  for (let i = 0; i < Nw; i++) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Nw);
+  const na = Math.max(0, idx(noise.from)), nb = Math.min(rec.length, idx(noise.to));
+  const Nn0 = energySpectrum(rec, na, nb, fftN, Nw, hann), segs = Math.max(1, Math.ceil((nb - na) / (Nw / 2)));
+  const Nn = new Float64Array(N / 2), ratio = N / Nw;
+  for (let k = 0; k < N / 2; k++) Nn[k] = (Nn0[Math.min(Nw / 2 - 1, Math.floor(k / ratio))] / segs / 0.375) * (len / Nw) / ratio;
+  const nScale = 1;
+  const binHz = sr / N;
+  return windows.map((w) => {
+    const a = Math.max(0, idx(w.at) - Math.round(0.05 * sr));
+    const Y = whole(rec, a, Math.min(rec.length, a + len));
+    const bands = THIRD_OCT.map((fc) => {
+      const lo = fc / 2 ** (1 / 6), hi = fc * 2 ** (1 / 6);
+      let y = 0, x = 0, nz = 0;
+      for (let k = Math.max(1, Math.floor(lo / binHz)); k <= Math.ceil(hi / binHz) && k < N / 2; k++) { y += Y[k]; x += X[k]; nz += Nn[k] * nScale; }
+      const sig = Math.max(y - nz, 1e-20);
+      return { f: fc, db: 10 * Math.log10(sig / Math.max(x, 1e-20)), snr: 10 * Math.log10((y + 1e-20) / (nz + 1e-20)) };
+    });
+    return { did: w.did, bands };
+  });
+}
+
+
+// 从扫频结果算出这台设备的“特长”：能放到多低（低于中频 10dB 的位置）、多高、低音有多足
+// （录音设备的麦克风本身也有偏差，但所有设备用同一个麦克风测，互相比较是准的）
+function profileFromBands(bands) {
+  const ok = bands.filter((b) => b.snr > 6);
+  const midB = ok.filter((b) => b.f >= 400 && b.f <= 2500);
+  if (midB.length < 3) return null;
+  const mid = midB.reduce((a, b) => a + b.db, 0) / midB.length;
+  const lowOk = ok.filter((b) => b.f <= 400 && b.db >= mid - 10).map((b) => b.f);
+  const highOk = ok.filter((b) => b.f >= 4000 && b.db >= mid - 12).map((b) => b.f);
+  const bassB = ok.filter((b) => b.f >= 50 && b.f <= 160);
+  return {
+    low: Math.round(lowOk.length ? Math.min(...lowOk) : 400),
+    high: Math.round(highOk.length ? Math.max(...highOk) : 4000),
+    bass: bassB.length ? Math.round((bassB.reduce((a, b) => a + b.db, 0) / bassB.length - mid) * 10) / 10 : -30,
+    level: Math.round(mid * 10) / 10,
+    measured: true,
+  };
+}
+
 // ===== separator.js =====
 // 实时拆声部：把立体声实时音频拆成 人声 / 鼓 / 贝斯 / 伴奏 四条单声道
 // 方法（浏览器里能实时跑的简化版，不是 AI 分离）：
@@ -3450,7 +3606,7 @@ function findEarlyCopy(mic, a, b, lagFrom, lagTo, getSrc, rate) {
 //   人声 = 中频段里“左右声道一模一样”的部分（人声通常混在正中间），且不是打击声
 //   鼓   = 谐波/打击分离（HPSS）里“打击”的部分
 //   伴奏 = 其余全部
-// 四条加起来 ≈ 原曲的单声道混音。
+// 每条都是立体声（同一个分离结果分别套在左、右声道上），四条加起来 = 原曲（完整重建，不丢东西）。
 
 class FFT {
   constructor(n) {
@@ -3501,9 +3657,9 @@ class Separator {
     this.prevVm = new Float64Array(K);
     this.in = { L: new Float32Array(0), R: new Float32Array(0), start: null };
     this.nextFrame = null;
-    this.acc = Object.fromEntries(STEMS.map((s) => [s, new Float64Array(N * 2)]));
+    this.acc = Object.fromEntries(STEMS.map((s) => [s, [new Float64Array(N * 2), new Float64Array(N * 2)]]));
     this.accStart = null;
-    this.pend = Object.fromEntries(STEMS.map((s) => [s, []]));
+    this.pend = Object.fromEntries(STEMS.map((s) => [s, [[], []]]));
     this.pendStart = null;
     this.tmp = { re: new Float64Array(N), im: new Float64Array(N) };
     this.median = new Float64Array(Math.max(this.T, this.F));
@@ -3545,7 +3701,7 @@ class Separator {
       Vm[k] = 0.5 * v + 0.5 * this.prevVm[k]; // 时间上平滑，减少“水声”
       this.prevVm[k] = v;
     }
-    this.hist.push({ Mre, Mim, mag, Vm, pos });
+    this.hist.push({ Mre, Mim, mag, Vm, pos, lr, li, rr, ri });
     if (this.hist.length < this.T) return;
     if (this.hist.length > this.T) this.hist.shift();
     this.emitCenter(out);
@@ -3556,7 +3712,8 @@ class Separator {
     const c = hist[(T - 1) / 2];
     const med = this.median;
     const spec = {};
-    for (const s of STEMS) spec[s] = { re: new Float64Array(N), im: new Float64Array(N) };
+    for (const s of STEMS) spec[s] = [0, 1].map(() => ({ re: new Float64Array(N), im: new Float64Array(N) }));
+    const chans = [[c.lr, c.li], [c.rr, c.ri]];
     for (let k = 0; k < K; k++) {
       // 谐波 = 时间方向中位数（持续的音），打击 = 频率方向中位数（瞬间的宽频冲击）
       for (let t = 0; t < T; t++) med[t] = hist[t].mag[k];
@@ -3573,31 +3730,31 @@ class Separator {
         vocals: (1 - Bm) * (1 - Pm) * Vm,
         other: (1 - Bm) * (1 - Pm) * (1 - Vm),
       };
-      for (const s of STEMS) {
-        const sp = spec[s];
-        sp.re[k] = c.Mre[k] * g[s]; sp.im[k] = c.Mim[k] * g[s];
+      for (const s of STEMS) for (let ch = 0; ch < 2; ch++) {
+        const sp = spec[s][ch], [cr, ci] = chans[ch];
+        sp.re[k] = cr[k] * g[s]; sp.im[k] = ci[k] * g[s];
         if (k > 0 && k < N / 2) { sp.re[N - k] = sp.re[k]; sp.im[N - k] = -sp.im[k]; }
       }
     }
     if (this.accStart === null) { this.accStart = c.pos; this.pendStart = c.pos; }
     const off = c.pos - this.accStart;
-    for (const s of STEMS) {
-      const { re, im } = spec[s];
+    for (const s of STEMS) for (let ch = 0; ch < 2; ch++) {
+      const { re, im } = spec[s][ch];
       this.fft.run(re, im, true);
-      const acc = this.acc[s];
+      const acc = this.acc[s][ch];
       for (let i = 0; i < N; i++) acc[off + i] += re[i] * this.win[i];
     }
     // c.pos 之前加上一个 hop 的样本已经叠加完毕，可以输出
     const done = off + this.H;
-    for (const s of STEMS) {
-      const acc = this.acc[s];
-      for (let i = 0; i < done; i++) this.pend[s].push(acc[i]);
+    for (const s of STEMS) for (let ch = 0; ch < 2; ch++) {
+      const acc = this.acc[s][ch];
+      for (let i = 0; i < done; i++) this.pend[s][ch].push(acc[i]);
       acc.copyWithin(0, done); acc.fill(0, acc.length - done);
     }
     this.accStart += done;
-    while (this.pend.vocals.length >= this.outChunk) {
+    while (this.pend.vocals[0].length >= this.outChunk) {
       const stems = {};
-      for (const s of STEMS) stems[s] = Float32Array.from(this.pend[s].splice(0, this.outChunk));
+      for (const s of STEMS) stems[s] = [0, 1].map((ch) => Float32Array.from(this.pend[s][ch].splice(0, this.outChunk)));
       out.push({ frame: this.pendStart, stems });
       this.pendStart += this.outChunk;
     }
@@ -3653,6 +3810,7 @@ function lineAt(lines, pos) {
 
 // ===== engine.js =====
 // 播放引擎：解码/合成音频、把“控制端时钟”换算成 AudioContext 时间、精确调度、漂移修正
+
 
 
 const DRIFT_LIMIT_MS = 35;
@@ -3878,6 +4036,20 @@ class Engine extends EventTarget {
     g.setTargetAtTime(plan, c(from), 0.05);
     g.setTargetAtTime(0, c(to), 0.05);
     g.setTargetAtTime(plan, c(end), 0.1);
+  }
+
+  // 测设备特长用的扫频：不经过音量（测的是设备本身能放出什么）
+  playSweepAt(at) {
+    if (!this.unlocked || this.ctx.state !== 'running') return false;
+    if (!this.sweepBuf) {
+      const c = makeSweep(this.ctx.sampleRate);
+      this.sweepBuf = this.ctx.createBuffer(1, c.length, this.ctx.sampleRate);
+      this.sweepBuf.copyToChannel(c, 0);
+    }
+    const when = this.clockToCtx(at);
+    if (when < this.ctx.currentTime + 0.01) return false;
+    const s = this.ctx.createBufferSource(); s.buffer = this.sweepBuf; s.connect(this.master); s.start(this.at(when));
+    return true;
   }
 
   // 校准用：在控制端时间 at（再加本机当前的总延迟，和放音乐时一样）播放一声“啾”
@@ -4714,7 +4886,7 @@ class LiveCapture extends EventTarget {
     });
     if (!ok) return;
     this.mode = 'android'; this.surface = 'android'; this.stream = null; this.videoTrack = null;
-    this.anchor = null; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
+    this.anchor = null; this.tsMap = []; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
     this.pend = [new Float32Array(FRAMES), new Float32Array(FRAMES)]; this.pi = 0; this.chunkFrame = 0; this.nextFrame = null;
     this.running = true;
     // 每 10ms 向 App 取一次新录到的声音（16 位立体声，base64）
@@ -4746,7 +4918,7 @@ class LiveCapture extends EventTarget {
     this.videoTrack = stream.getVideoTracks()[0] || null; // 画面留着给“同步画面”用
     this.setVideoActive(false); // 平时不用画面：降到每秒 1 帧，减少电脑负担（避免 YouTube 卡顿）
     const track = stream.getAudioTracks()[0];
-    this.anchor = null; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
+    this.anchor = null; this.tsMap = []; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
     this.running = true;
     track.addEventListener('ended', () => this.stop());
     // 首选：直接按顺序读采集流（电脑忙的时候声音会排队等着，不会丢）
@@ -4848,7 +5020,14 @@ class LiveCapture extends EventTarget {
   }
 
   // 采集帧号 -> 控制端时钟（毫秒）。时间线连续推进，速度由下面的“跟踪”慢慢调整，不会跳
-  tsOf() { return this.tsNext; }
+  // 某个采集帧号对应的控制端时间（拆声部等有处理延迟的地方要用“那一帧”的时间，而不是现在）
+  tsOf(frame) {
+    const m = this.tsMap;
+    if (!m?.length) return this.tsNext;
+    let best = m[m.length - 1];
+    for (let i = m.length - 1; i >= 0; i--) { best = m[i]; if (m[i][0] <= frame) break; }
+    return best[1] + ((frame - best[0]) / SR) * 1000 * (this.k || 1);
+  }
   onChunk({ frame, l, r }) {
     const now = this.hostNow(), step = (FRAMES / SR) * 1000;
     if (!this.anchor) { this.anchor = { host: now - step, frame }; this.tsNext = now - step; this.k = 1; this.kI = 0; this.lastFrame = frame - FRAMES; }
@@ -4857,6 +5036,7 @@ class LiveCapture extends EventTarget {
     this.lastFrame = frame;
     const ts = this.tsNext;
     this.tsNext += step * this.k;
+    (this.tsMap ||= []).push([frame, ts]); if (this.tsMap.length > 300) this.tsMap.shift();
     // 长期漂移跟踪：只看 3 秒内“处理得最及时”的那一段（电脑忙只会让数值变大，取最小值就排除了）。
     // 不再一次跳 10~20ms，而是微调时间线的速度（最多 ±0.3%），几秒内平滑追上；
     // 同时记住声卡时钟的快慢差，之后就几乎不用再追
@@ -5125,7 +5305,8 @@ const PB_CODE = { stopped: 0, playing: 1, paused: 2 }, PB_NAME = ['stopped', 'pl
 // 实时音源：完整混音 + （开启拆声部时）四个声部
 function liveGroup(stems) {
   const tracks = [{ id: 'live', name: '完整混音', src: 'live', channels: 2, duration: 0, role: 'mix' }];
-  if (stems) for (const st of STEMS) tracks.push({ id: 'lv-' + st, name: STEM_NAMES[st], src: 'live:' + st, channels: 1, duration: 0, role: st });
+  if (stems) for (const st of STEMS) tracks.push({ id: 'lv-' + st, name: STEM_NAMES[st], src: 'live:' + st, channels: 2, duration: 0, role: st });
+  tracks.push({ id: 'lv-band', name: '乐团角色（每台设备专属）', src: 'live:band', channels: 2, duration: 0, role: 'band' });
   return { id: 'live', name: window.SoundMeshApp ? '手机实时音源（YouTube Music / Spotify…）' : '电脑实时音源（YouTube / Spotify…）', kind: 'live', loop: false, duration: 0, tracks };
 }
 // 歌曲当前位置（秒），用于歌词滚动。ly = { a, s, o }：实时音源用“点一句对准”的锚点，文件用播放进度 + 偏移
@@ -5480,11 +5661,13 @@ const host = {
     { const m = new Float32Array(l.length); for (let i = 0; i < l.length; i++) m[i] = (l[i] + r[i]) * 0.5;
       const ring = this.srcRing || (this.srcRing = []); ring.push({ ts, x: m }); while (ring.length && ts - ring[0].ts > 15000) ring.shift(); }
     // 拆声部：只有当有设备需要某个声部时才运行
-    if (H.liveStems && STEMS.some((st) => this.anyNeeds('live:' + st))) {
+    const needBand = this.anyNeeds('live:band');
+    if ((H.liveStems && STEMS.some((st) => this.anyNeeds('live:' + st))) || needBand) {
       this.sep = this.sep || new Separator(48000, 960);
       for (const o of this.sep.push(frame, l, r)) {
         const ts2 = this.live.tsOf(o.frame);
-        for (const st of STEMS) this.dispatch('live:' + st, ts2, [o.stems[st]]);
+        if (H.liveStems) for (const st of STEMS) if (this.anyNeeds('live:' + st)) this.dispatch('live:' + st, ts2, o.stems[st]);
+        if (needBand) this.dispatchBand(ts2, o.stems);
       }
     } else this.sep = null;
   },
@@ -5505,14 +5688,35 @@ const host = {
     }
     if (wantOpus) this.encoderFor(src, planes.length).encode(ts, planes);
   },
-  encoderFor(src, ch) {
+  // 乐团模式：按每台设备的角色把四个声部混成一份专属立体声，分别发给它
+  dispatchBand(ts, stems) {
+    const pm = this.plans(), mixFor = (did) => {
+      const w = pm[did]?.band; if (!w) return null;
+      const n = stems.vocals[0].length, L = new Float32Array(n), R = new Float32Array(n);
+      for (const st of STEMS) { const [al, ar] = w.lr?.[st] || [w[st] || 0, w[st] || 0]; if (!al && !ar) continue; const [sl, sr] = stems[st]; for (let i = 0; i < n; i++) { L[i] += al * sl[i]; R[i] += ar * sr[i]; } }
+      return [L, R];
+    };
+    if (this.selfEngine && this.needs('self', 'live:band')) {
+      const planes = mixFor('self');
+      if (planes) { const buf = this.selfEngine.ctx.createBuffer(2, planes[0].length, 48000); planes.forEach((p, i) => buf.copyToChannel(p, i)); this.selfEngine.pushLive(ts, buf, 'live:band'); }
+    }
+    for (const c of this.link?.clients.values() || []) {
+      if (!c.did || !this.needs(c.did, 'live:band')) continue;
+      const planes = mixFor(c.did); if (!planes) continue;
+      if (this.opusFor(c)) { const e = this.encoderFor('live:band|' + c.did, 2, c); e.only = c; e.encode(ts, planes); continue; }
+      if (this.link.buffered(c) > 96 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
+      if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: 2, s: 'live:band' }, pcmEncode(planes)))) this.dg.sent++;
+    }
+  },
+  encoderFor(src, ch, only = null) {
     let e = this.encoders.get(src);
     if (!e) {
+      const wire = only ? 'live:band' : src; // 专属编码器（乐团模式）只发给那一台设备
       e = new StreamEncoder(ch, (ts, data) => {
-        for (const c of this.link?.clients.values() || []) {
-          if (!c.did || !this.opusFor(c) || !this.needs(c.did, src)) continue;
+        for (const c of only ? [e.only] : this.link?.clients.values() || []) {
+          if (!c.did || !this.opusFor(c) || !this.needs(c.did, wire)) continue;
           if (this.link.buffered(c) > 24 * 1024) { c.dropped = (c.dropped || 0) + 1; continue; }
-          if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: src }, data))) this.dg.sent++;
+          if (this.link.sendBin(c, packBin({ k: 'l', ts, c: 'o', ch, s: wire }, data))) this.dg.sent++;
         }
       }, H.quality === 'standard' ? 'standard' : 'high');
       this.encoders.set(src, e);
@@ -5635,7 +5839,7 @@ const host = {
   wire(plans) {
     const g = this.group(), pb = H.playback;
     const w = {
-      v: 1, ep: EPOCH, ld: H.liveDelay, mo: H.motion.y !== 'off' ? { y: H.motion.y, p: H.motion.p, d: H.motion.d, t0: H.motion.t0 } : null, ly: H.lyrics ? { id: H.lyrics.id, a: H.ly.a, s: H.ly.s, o: H.ly.o } : null, pb: [PB_CODE[pb.status], Math.round(pb.startServerTime), r3(pb.startOffset)], m: H.mode === 'split' ? 1 : 0,
+      v: 1, ep: EPOCH, ld: H.liveDelay, mo: H.motion.y !== 'off' ? { y: H.motion.y, p: H.motion.p, d: H.motion.d, t0: H.motion.t0 } : null, ly: H.lyrics ? { id: H.lyrics.id, a: H.ly.a, s: H.ly.s, o: H.ly.o } : null, pb: [PB_CODE[pb.status], Math.round(pb.startServerTime), r3(pb.startOffset)], m: H.mode === 'split' ? 1 : H.mode === 'band' ? 2 : 0,
       g: g ? { id: g.id, k: g.kind, n: g.name.slice(0, 60), l: g.loop ? 1 : 0, d: r3(g.duration || 0), t: g.tracks.map((t) => [t.src, t.channels]) } : null,
       p: {},
     };
@@ -5644,7 +5848,7 @@ const host = {
       const idx = (id) => g.tracks.findIndex((t) => t.id === id);
       w.p[did] = [r3(pl.gain), r1(pl.delayMs), d.latencyMs,
         pl.sources.map((s) => [idx(s.trackId), s.mix.type === 'lr' ? ['l', r3(s.mix.wl), r3(s.mix.wr)] : s.mix.type === 'ch' ? ['c', s.mix.index] : ['s'], s.filters.map((f) => [f.type[0], Math.round(f.freq)])]),
-        (H.mode === 'split' ? pl.assign.map((k) => assignLabel(H, k)).join(' + ') : '协同播放').slice(0, 60), d.color, d.name, Math.round(pl.azimuth)];
+        (pl.band ? this.bandLabel(pl.band) : H.mode === 'split' ? pl.assign.map((k) => assignLabel(H, k)).join(' + ') : '协同播放').slice(0, 60), d.color, d.name, Math.round(pl.azimuth)];
     }
     return w;
   },
@@ -5678,7 +5882,8 @@ const host = {
     const now0 = Date.now();
     this.lagHist = (this.lagHist || []).filter((x) => now0 - x.t < 60000);
     if (Number.isFinite(this.lagShown)) this.lagHist.push({ t: now0, v: this.lagShown });
-    const lagMax = Math.max(30, ...this.lagHist.map((x) => x.v));
+    const sepLag = (H.liveStems || H.mode === 'band') && this.group()?.kind === 'live' ? 70 : 0; // 拆声部要多等约 64ms
+    const lagMax = Math.max(30, ...this.lagHist.map((x) => x.v)) + sepLag;
     const plansNow = this.plans();
     let need = 0, needBy = null;
     for (const d of Object.values(H.devices)) {
@@ -5819,6 +6024,8 @@ const host = {
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.calibrate();
+    $('#profileBtn').onclick = () => this.profileDevices();
+    $('#bandGlue').oninput = (e) => { H.bandGlue = Number(e.target.value) / 100; $('#bandGlueVal').textContent = e.target.value + '%'; this.changed(); };
     $('#musicCalBtn').onclick = () => this.musicCalibrate();
     $('#checkBtn').onclick = () => this.checkAssign();
     $('#lySearch').onclick = () => this.lySearch();
@@ -6009,6 +6216,55 @@ const host = {
     if (a.hidden) return '它的 SoundMesh 在后台：切回前台、亮着屏幕再校准';
     if (a.played < a.total) return `测试音只播出 ${a.played}/${a.total} 次：那台设备可能太忙或时间还没对准，过几秒再试`;
     return '测试音播了，但录音设备没听清：把它的系统音量调大一点、或把录音设备放近一点、周围安静一点';
+  },
+
+  // 设备特长：测过就用测的；没测过按设备类型估（手机小喇叭低音最少，电脑/平板好一些）
+  capOf(d) { return capOf(d); },
+  // “🎤 人声 45% · 🎹 伴奏 30%”：这台设备在乐团里主要负责什么
+  bandLabel(w) {
+    const parts = Object.entries(w).filter(([k]) => BAND_PARTS[k]);
+    const tot = parts.reduce((a, [, b]) => a + b, 0) || 1;
+    return parts.sort((a, b) => b[1] - a[1]).filter(([, v], i) => i === 0 || v / tot > 0.15).slice(0, 3).map(([k, v]) => `${BAND_PARTS[k]} ${Math.round((v / tot) * 100)}%`).join(' · ');
+  },
+
+  // 测各设备特长：每台轮流播 2 秒扫频（从低到高），录音后算出能放多低、多高
+  async profileDevices() {
+    if (this.calibrating) return;
+    const out = (h) => ($('#bandOut').innerHTML = h);
+    const micId = $('#calibMic').value;
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (!devs.length) return toast('还没有在线的播放设备');
+    this.calibrating = true; $('#profileBtn').disabled = true;
+    let recorder = null;
+    try {
+      out('🎙 打开麦克风中…（录音设备用“校准与检查”里选的那台，放在你坐的位置）');
+      const mic = await this.openMic(micId); recorder = mic.recorder;
+      const T0 = hostNow() + 900, STEP = SWEEP_SEC * 1000 + 900;
+      const noise = { from: T0 + 100, to: T0 + 800 };
+      const windows = devs.map((d, i) => ({ did: d.id, at: T0 + 1000 + i * STEP }));
+      const end = windows[windows.length - 1].at + STEP;
+      for (const w of windows) {
+        if (w.did === 'self') { this.selfEngine.duck(end); this.selfEngine.playSweepAt(w.at); }
+        else for (const c of this.link.clients.values()) if (c.did === w.did) this.link.send(c, { t: 'sweep', at: w.at, until: end });
+      }
+      out(`🔊 各设备轮流播放从低到高的扫频音，请保持安静…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
+      let res;
+      if (recorder) { await sleep(end - hostNow()); await sleep(30); res = analyzeResponse(recorder.stop(), windows, noise); recorder = null; }
+      else {
+        this.link.send(mic.client, { t: 'measure', kind: 'response', end, windows, noise });
+        const r = await this.waitFor(micId, end - hostNow() + 20000);
+        if (!r || r.t !== 'measureResult') throw new Error('录音设备没有返回结果');
+        res = r.results;
+      }
+      const rows = res.map((r) => { const d = H.devices[r.did], p = profileFromBands(r.bands); if (d && p) d.cap = p; return { d, p }; });
+      out(`✅ 测好了：<table class="small" style="width:100%;margin-top:4px">${rows.map(({ d, p }) => `<tr><td>${esc(d?.name || '?')}</td><td>${p ? `低音到 <b>${p.low} Hz</b> · 高音到 <b>${(p.high / 1000).toFixed(0)} kHz</b>` : '<span style="color:var(--bad)">没听清（音量调大一点再试）</span>'}</td></tr>`).join('')}</table><div class="muted">低音数字越小 = 低音越足。乐团模式会自动按这个分配角色。</div>`);
+      this.changed();
+    } catch (e) {
+      out('❌ ' + esc(e.message || String(e)));
+    } finally {
+      if (recorder) try { recorder.stop(); } catch {}
+      this.calibrating = false; $('#profileBtn').disabled = false;
+    }
   },
 
   // 一台设备排定的总延迟（按位置的延迟 + 延迟微调），和设备那边 plan.D 一样
@@ -6450,6 +6706,13 @@ const host = {
     setVal('#roomW', H.size.w); setVal('#roomH', H.size.h); setVal('#master', H.masterVolume);
     $('#masterVal').textContent = Math.round(H.masterVolume * 100) + '%';
     $('#splitBox').style.display = H.mode === 'split' ? '' : 'none';
+    $('#bandBox').style.display = H.mode === 'band' ? '' : 'none';
+    if (H.mode === 'band') {
+      $('#bandGlue').value = Math.round((H.bandGlue ?? 0.25) * 100); $('#bandGlueVal').textContent = Math.round((H.bandGlue ?? 0.25) * 100) + '%';
+      const pm = this.plans(), g = this.group();
+      $('#bandRoles').innerHTML = g?.kind !== 'live' ? '<div style="color:var(--warn,#f59f00)">乐团模式目前用于“电脑实时音源”。播放文件时会自动按协同播放处理。</div>'
+        : `<table class="small" style="width:100%">${Object.values(H.devices).filter((d) => d.online && pm[d.id]?.band).map((d) => { const c = this.capOf(d); return `<tr><td><span style="color:${d.color}">●</span> ${esc(d.name)}<div class="muted">${c.measured ? '实测' : '估计'}：低音到 ${c.low}Hz</div></td><td>${esc(this.bandLabel(pm[d.id].band))}</td></tr>`; }).join('')}</table>`;
+    }
     $('#deskMode').textContent = Math.max(H.size.w, H.size.h) > 3 ? '🪑 切换到桌面模式' : '🏠 切回房间模式';
   },
 
@@ -6573,7 +6836,7 @@ const host = {
     } else f('stats').textContent = '';
     f('badges').innerHTML = badges.join(' ');
     if (plan) {
-      const a = H.mode === 'split' ? ` · 负责 <b>${plan.assign.map((k) => esc(assignLabel(H, k))).join(' + ') || '无'}</b>` : '';
+      const a = plan.band ? ` · 🎼 <b>${esc(this.bandLabel(plan.band))}</b>` : H.mode === 'split' ? ` · 负责 <b>${plan.assign.map((k) => esc(assignLabel(H, k))).join(' + ') || '无'}</b>` : '';
       f('plan').innerHTML = `距离 ${plan.distance.toFixed(2)}m · 方位 ${plan.azimuth.toFixed(0)}° · 增益 ${Math.round(plan.autoGain * 100)}% · 位置延迟 ${plan.delayMs.toFixed(1)}ms${a}`;
     } else f('plan').textContent = '';
     setVal(f('volume'), d.volume); f('volVal').textContent = Math.round(d.volume * 100) + '%';
@@ -6748,6 +7011,9 @@ const node = {
       this.engine.hush(!!m.on, m.at);
     } else if (m.t === 'lyrics') {
       this.lyrics = m.ly;
+    } else if (m.t === 'sweep') {
+      if (m.until) this.engine.duck(m.until);
+      if (m.at) this.engine.playSweepAt(m.at);
     } else if (m.t === 'chirp' && Array.isArray(m.at)) {
       if (m.until) this.engine.duck(m.until);
       const played = m.at.filter((t) => this.engine.playChirpAt(t, !!m.raw)).length;
@@ -6779,7 +7045,9 @@ const node = {
           this.link.send({ t: 'measureResult', raw: { n, startHost: data.startHost, inLat: data.inLat || 0, rate: 24000 } });
           return;
         }
-        const results = m.kind === 'spectrum'
+        const results = m.kind === 'response'
+          ? analyzeResponse(data, m.windows, m.noise)
+          : m.kind === 'spectrum'
           ? analyzeWindows(data, m.windows, m.noise)
           : detectChirps(data, m.slots).map((r) => ({ did: r.did, err: r.err, ok: r.ok }));
         this.link.send({ t: 'measureResult', results });

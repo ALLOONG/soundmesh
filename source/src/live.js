@@ -82,7 +82,7 @@ export class LiveCapture extends EventTarget {
     });
     if (!ok) return;
     this.mode = 'android'; this.surface = 'android'; this.stream = null; this.videoTrack = null;
-    this.anchor = null; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
+    this.anchor = null; this.tsMap = []; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
     this.pend = [new Float32Array(FRAMES), new Float32Array(FRAMES)]; this.pi = 0; this.chunkFrame = 0; this.nextFrame = null;
     this.running = true;
     // 每 10ms 向 App 取一次新录到的声音（16 位立体声，base64）
@@ -114,7 +114,7 @@ export class LiveCapture extends EventTarget {
     this.videoTrack = stream.getVideoTracks()[0] || null; // 画面留着给“同步画面”用
     this.setVideoActive(false); // 平时不用画面：降到每秒 1 帧，减少电脑负担（避免 YouTube 卡顿）
     const track = stream.getAudioTracks()[0];
-    this.anchor = null; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
+    this.anchor = null; this.tsMap = []; this.minErr = Infinity; this.errN = 0; this.stats = { chunks: 0, level: 0 };
     this.running = true;
     track.addEventListener('ended', () => this.stop());
     // 首选：直接按顺序读采集流（电脑忙的时候声音会排队等着，不会丢）
@@ -216,7 +216,14 @@ export class LiveCapture extends EventTarget {
   }
 
   // 采集帧号 -> 控制端时钟（毫秒）。时间线连续推进，速度由下面的“跟踪”慢慢调整，不会跳
-  tsOf() { return this.tsNext; }
+  // 某个采集帧号对应的控制端时间（拆声部等有处理延迟的地方要用“那一帧”的时间，而不是现在）
+  tsOf(frame) {
+    const m = this.tsMap;
+    if (!m?.length) return this.tsNext;
+    let best = m[m.length - 1];
+    for (let i = m.length - 1; i >= 0; i--) { best = m[i]; if (m[i][0] <= frame) break; }
+    return best[1] + ((frame - best[0]) / SR) * 1000 * (this.k || 1);
+  }
   onChunk({ frame, l, r }) {
     const now = this.hostNow(), step = (FRAMES / SR) * 1000;
     if (!this.anchor) { this.anchor = { host: now - step, frame }; this.tsNext = now - step; this.k = 1; this.kI = 0; this.lastFrame = frame - FRAMES; }
@@ -225,6 +232,7 @@ export class LiveCapture extends EventTarget {
     this.lastFrame = frame;
     const ts = this.tsNext;
     this.tsNext += step * this.k;
+    (this.tsMap ||= []).push([frame, ts]); if (this.tsMap.length > 300) this.tsMap.shift();
     // 长期漂移跟踪：只看 3 秒内“处理得最及时”的那一段（电脑忙只会让数值变大，取最小值就排除了）。
     // 不再一次跳 10~20ms，而是微调时间线的速度（最多 ±0.3%），几秒内平滑追上；
     // 同时记住声卡时钟的快慢差，之后就几乎不用再追
