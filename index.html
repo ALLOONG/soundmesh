@@ -261,6 +261,14 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         </div>
         <div id="livePanel" class="stack small" hidden>
           <button id="liveBtn" class="primary" style="width:100%;font-size:15px;padding:10px">🎙 开始共享电脑声音</button>
+          <div class="row" style="font-size:14px;gap:8px"><span>🎧 <b>音质</b></span>
+            <select id="quality" class="grow" style="min-width:0">
+              <option value="auto">🤖 自动（推荐）</option>
+              <option value="lossless">🎧 无损</option>
+              <option value="high">⭐ 高音质 Opus 320</option>
+              <option value="standard">省流量 Opus 160</option>
+            </select></div>
+          <div id="qualityHint" class="muted" style="margin-top:-4px"></div>
           <label style="font-size:14px"><input type="checkbox" id="videoMode" /> 🎬 <b>看视频模式</b>：把延迟压到最低（直接在 YouTube 全屏看视频，声音只晚一点点）</label>
           <button id="diagBtn" class="small">🩺 复制诊断记录（最近 2 分钟）</button>
           <textarea id="diagOut" hidden readonly style="width:100%;height:90px;font-size:10px;background:var(--bg);color:var(--muted);border:1px solid var(--line);border-radius:6px"></textarea>
@@ -271,12 +279,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
           <label><input type="checkbox" id="liveStems" /> 🎚 实时拆声部（人声/鼓/贝斯/伴奏，配合“声音分工”按位置分给各设备）</label>
           <label><input type="checkbox" id="pcPlay" /> 电脑也出声（关掉 = 只有手机/平板出声，电脑静音）</label>
           <label><input type="checkbox" id="autoDelay" /> 自动调节（有设备卡顿时自动加大缓冲）</label>
-          <label>音质 <select id="quality">
-            <option value="auto">🤖 自动（推荐：网络好用无损，哪台网络跟不上就那台临时换 Opus 320）</option>
-            <option value="lossless">🎧 无损（原始 CD 音质，每台约 1.5 Mbps，手机热点/家里 Wi-Fi 都够）</option>
-            <option value="high">⭐ 高音质（Opus 320kbps，几乎听不出差别，流量只要无损的 1/5）</option>
-            <option value="standard">省流量（Opus 160kbps，网络差的时候用）</option>
-          </select></label>
+
           <div class="muted">
             点按钮后会弹出“共享”窗口：<br />
             · 在<b>标签页</b>里选正在放 YouTube Music 的网页，并打开“<b>同时共享标签页音频</b>”；<br />
@@ -5198,17 +5201,19 @@ const host = {
         cap: this.live.running ? 1 : 0, chunks: dg.chunks, gap: Math.round(dg.maxGap), sent: dg.sent, sil: dg.silent || 0, pk: Math.round((dg.peak || 0) * 100),
         lag: this.lagShown === undefined ? null : Math.round(this.lagShown), ld: H.liveDelay, ctx: this.live.ctx?.state?.[0] || '-',
         buf: clients.map((c) => Math.round(this.link.buffered(c) / 1024)),
+        floor: this.delayFloor ?? null,
         dev: Object.values(H.devices).filter((d) => d.online && d.id !== 'self').map((d) => {
-          const s = d.stats || {};
-          return [d.name.slice(0, 8), s.live?.got ?? null, s.live?.late ?? null, s.live?.res ?? s.drifts ?? null, s.rtt ?? null, s.jitter ?? null, s.out ?? null, s.hidden ? 1 : 0, s.via === 'backup' ? 'B' : 'P'];
+          const s = d.stats || {}, c = clients.find((x) => x.did === d.id), pl = this.plans()[d.id];
+          return [d.name.slice(0, 8), s.live?.got ?? null, s.live?.late ?? null, s.live?.res ?? s.drifts ?? null, s.rtt ?? null, s.jitter ?? null, s.out ?? null, s.hidden ? 1 : 0, s.via === 'backup' ? 'B' : 'P',
+            pl ? Math.round(pl.D) : null, c ? (this.opusFor(c) ? 'Opus' : 'PCM') : '-', s.live?.concealed ?? 0];
         }),
       });
       dg.chunks = 0; dg.maxGap = 0; dg.sent = 0; dg.silent = 0; dg.peak = 0;
       if (dg.log.length > 120) dg.log.shift();
     }, 1000);
     $('#diagBtn').onclick = () => {
-      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} 采集方式=${this.live.mode || '-'} UA=${navigator.userAgent}\n列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 静音片段数 音量峰值 处理延迟 缓冲ms 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道]\n`;
-      const txt = head + this.dg.log.map((r) => [r.t, r.vis, r.foc, r.cap, r.chunks, r.gap, r.sent, `静音${r.sil}`, `峰值${r.pk}`, r.lag, r.ld, r.ctx, JSON.stringify(r.buf), JSON.stringify(r.dev)].join(' ')).join('\n');
+      const head = `SoundMesh 诊断 ${new Date().toLocaleString()} 采集方式=${this.live.mode || '-'} UA=${navigator.userAgent}\n音质=${H.quality} 列：时间 vis(v/h) foc 采集 每秒片段 最大间隔ms 每秒发送 静音片段数 音量峰值 处理延迟 缓冲ms 最低缓冲 音频状态 发送队列KB 设备[名,收到,迟到,重新对齐,往返,抖动,输出延迟,后台,通道,延迟微调D,编码,补偿次数]\n`;
+      const txt = head + this.dg.log.map((r) => [r.t, r.vis, r.foc, r.cap, r.chunks, r.gap, r.sent, `静音${r.sil}`, `峰值${r.pk}`, r.lag, r.ld, r.floor, r.ctx, JSON.stringify(r.buf), JSON.stringify(r.dev)].join(' ')).join('\n');
       $('#diagOut').hidden = false; $('#diagOut').value = txt;
       navigator.clipboard?.writeText(txt).then(() => toast('诊断记录已复制，直接粘贴给 Claude 就行'), () => toast('自动复制失败：请在下面的框里全选后复制'));
     };
@@ -5274,6 +5279,7 @@ const host = {
       // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
       const late = msg.stats?.live?.late;
       if (H.autoDelay && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 3000) {
+        this.safeFloor = Math.max(this.safeFloor || 0, H.liveDelay + 20); this.safeUntil = Date.now() + 180000; // 记住：3 分钟内别再压到这么低
         H.liveDelay = Math.min(3000, H.liveDelay + (H.videoMode ? 30 : 250)); // 看视频模式只回加一点点
         this.lastBump = Date.now();
         toast(`${H.devices[c.did].name} 有卡顿，缓冲自动加到 ${H.liveDelay} ms`);
@@ -5335,9 +5341,10 @@ const host = {
     const now = performance.now();
     for (const c of this.link?.clients.values() || []) {
       if (!c.did || !c.opus) continue;
-      const d = H.devices[c.did], late = d?.stats?.live?.late ?? 0, dropped = c.dropped || 0;
-      const bad = this.link.buffered(c) > 48 * 1024 || dropped > (c.lastDropped ?? dropped) || late > (c.lastLate ?? late) + 1;
-      c.lastDropped = dropped; c.lastLate = late;
+      const d = H.devices[c.did], dropped = c.dropped || 0;
+      // 只看网络本身（发送排队、被丢弃）；“迟到”是缓冲不够，由自动缓冲处理，不是换编码能解决的
+      const bad = this.link.buffered(c) > 48 * 1024 || dropped > (c.lastDropped ?? dropped);
+      c.lastDropped = dropped;
       if (bad) { if (!c.autoOpus) toast(`📶 ${d?.name || '设备'} 的网络跟不上无损，暂时改用 Opus 320（几乎听不出差别）`); c.autoOpus = true; c.autoSince = now; }
       else if (c.autoOpus && now - c.autoSince > 60000) { c.autoOpus = false; } // 稳定一分钟：再试无损
     }
@@ -5575,10 +5582,26 @@ const host = {
     // 自动调节：一段时间没有设备卡顿，就把缓冲往下压，慢慢找到最低又不卡的值。
     // 看视频模式更积极：6 秒没卡就降 20ms，最低 80ms（声音只比画面晚一点点）
     const anyHidden = Object.values(H.devices).some((d) => d.online && d.stats?.hidden);
-    // 下限：看视频模式按“最慢那台设备的扬声器延迟 + 35ms 传输处理”自动算（最低 40ms）
-    const outs = Object.values(H.devices).filter((d) => d.online && d.id !== 'self').map((d) => d.stats?.out || 0);
-    const floor = H.videoMode ? Math.max(40, Math.ceil(((outs.length ? Math.max(...outs) : 0) + 35) / 10) * 10) : 100;
-    this.delayFloor = floor;
+    // 下限：每台设备需要的最少缓冲 = 它被要求“提前播”的量（延迟微调为负数时）+ 它的扬声器延迟
+    //        + 电脑最近 1 分钟最慢的处理延迟 + 网络和处理余量。取所有在线设备里最大的那个。
+    const now0 = Date.now();
+    this.lagHist = (this.lagHist || []).filter((x) => now0 - x.t < 60000);
+    if (Number.isFinite(this.lagShown)) this.lagHist.push({ t: now0, v: this.lagShown });
+    const lagMax = Math.max(30, ...this.lagHist.map((x) => x.v));
+    const plansNow = this.plans();
+    let need = 0, needBy = null;
+    for (const d of Object.values(H.devices)) {
+      if (!d.online || d.id === 'self') continue;
+      const D = plansNow[d.id]?.D ?? ((plansNow[d.id]?.delayMs || 0) + (d.latencyMs || 0));
+      const v = Math.max(0, -D) + (d.stats?.out || 0) + lagMax + (d.stats?.rtt || 10) / 2 + (H.videoMode ? 25 : 60);
+      if (v > need) { need = v; needBy = d; }
+    }
+    // 最近 3 分钟内有设备卡顿过：卡顿时的缓冲 + 20ms 就是新的下限（不再反复往下压到会卡的程度）
+    const learned = this.safeUntil > now0 ? this.safeFloor || 0 : 0;
+    const floor = Math.ceil(Math.max(H.videoMode ? 40 : 100, need, learned) / 10) * 10;
+    this.delayFloor = floor; this.delayFloorBy = needBy;
+    // 下限比现在的缓冲还高（比如刚改了延迟微调）：直接提上去，不等卡顿
+    if (H.autoDelay && this.live.running && H.liveDelay < floor) { H.liveDelay = floor; this.changed(); }
     const calm = H.videoMode ? 6000 : 20000, every = H.videoMode ? 4000 : 10000;
     if (H.autoDelay && this.live.running && H.liveDelay > floor && !anyHidden) {
       const now = Date.now();
@@ -6072,6 +6095,7 @@ const host = {
     if (document.activeElement !== $('#liveDelay')) $('#liveDelay').value = H.liveDelay;
     $('#liveDelayVal').textContent = `${H.liveDelay} ms`;
     $('#quality').value = H.quality || (H.opus ? 'high' : 'lossless');
+    $('#qualityHint').textContent = { auto: '平时用无损（原始 CD 音质）；哪台设备网络跟不上，就只有那台临时换 Opus 320，稳定后自动换回', lossless: '原始 CD 音质，每台约 1.5 Mbps，手机热点/家里 Wi-Fi 都够', high: 'Opus 320kbps，几乎听不出和无损的差别，流量只要无损的 1/5', standard: 'Opus 160kbps，网络很差的时候用' }[$('#quality').value] || '';
     $('#autoDelay').checked = H.autoDelay;
     $('#pcPlay').checked = H.pcPlay !== false;
     $('#liveStems').checked = !!H.liveStems;
@@ -6082,7 +6106,7 @@ const host = {
     const clients = [...this.link?.clients.values() || []].filter((c) => c.did);
     const opusN = clients.filter((c) => this.opusFor(c)).length;
     const dropped = clients.reduce((a, c) => a + (c.dropped || 0), 0);
-    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (H.videoMode && this.delayFloor ? ` · 看视频模式最低可到 ${this.delayFloor} ms` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
+    const lagTxt = (this.live.running && this.lagShown !== undefined ? ` · ${this.live.surface === 'android' ? '手机' : '电脑'}处理延迟 ${Math.round(this.lagShown)} ms` : '') + (this.delayFloor ? ` · 现在最低可到 ${this.delayFloor} ms${this.delayFloorBy && (this.plans()[this.delayFloorBy.id]?.D || 0) < -30 ? `（${this.delayFloorBy.name} 的延迟微调是 ${Math.round(this.plans()[this.delayFloorBy.id].D)} ms，要“提前播”这么多，所以需要更多缓冲）` : ''}` : '') + (document.documentElement.dataset.smExt && this.live.running ? ` · 🎞️ 扩展已连接：YouTube 画面延后 ${Math.round(this.mirrorDelay())} ms` : '');
     const surf = { browser: '标签页 ✅', window: '窗口 ⚠️', monitor: '整个屏幕 ⚠️', android: '手机 App 声音 ✅' }[this.live.surface] || '未知';
     $('#liveStatus').textContent = on
       ? `${H.liveStems ? (this.sep ? '🎚 拆声部中 · ' : '🎚 拆声部（等待分工模式） · ') : ''}共享类型：${surf}${lagTxt}${this.live.surface === 'android' ? '（这台手机会照常播放原声，比其他设备早一点）' : this.live.surface !== 'browser' ? '（电脑原声不会静音，手机会比电脑晚）' : ''} · 正在采集 · 已发送 ${this.live.stats.chunks} 段 · ${opusN ? `${opusN} 台用 Opus ${H.quality === 'standard' ? '160' : '320'}kbps、` : ''}${clients.length - opusN} 台用无损 PCM${dropped ? ` · 网络丢弃 ${dropped} 段` : ''}`
@@ -6579,7 +6603,7 @@ const node = {
         unlocked: e.unlocked && e.ctx.state === 'running', synced: this.clock.synced,
         hidden: document.visibilityState !== 'visible', awake: !!this.wake, via: this.link.via, bg: !!e.bgMode,
         ready: li.loaded === li.needed, loading: li.loaded < li.needed, dl: this.dlPercent(),
-        live: isLive ? { got: e.liveStats.got, late: e.liveStats.late, res: e.liveStats.resyncs } : null, drifts: e.resyncs,
+        live: isLive ? { got: e.liveStats.got, late: e.liveStats.late, res: e.liveStats.resyncs, concealed: e.liveStats.concealed || 0 } : null, drifts: e.resyncs,
         error: e.error ? String(e.error).slice(0, 100) : null,
       },
     });
