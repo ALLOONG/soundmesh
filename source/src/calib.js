@@ -37,11 +37,15 @@ class Rec extends AudioWorkletProcessor {
 registerProcessor('sm-rec', Rec);`;
 
 export class MicRecorder {
-  constructor(ctx, clockNow) { this.ctx = ctx; this.clockNow = clockNow; }
+  constructor(ctx, clockNow, deviceId = '') { this.ctx = ctx; this.clockNow = clockNow; this.deviceId = deviceId; }
   async start() {
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
-    });
+    const audio = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 };
+    if (this.deviceId) audio.deviceId = { exact: this.deviceId };
+    try { this.stream = await navigator.mediaDevices.getUserMedia({ audio }); }
+    catch (e) {
+      if (!this.deviceId) throw e;
+      delete audio.deviceId; this.stream = await navigator.mediaDevices.getUserMedia({ audio }); // 选的麦克风拔掉了：用默认的
+    }
     if (this.ctx.state !== 'running') await this.ctx.resume();
     if (!this.ctx.__smRec) {
       const url = URL.createObjectURL(new Blob([REC_WORKLET], { type: 'application/javascript' }));

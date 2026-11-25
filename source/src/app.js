@@ -806,6 +806,11 @@ const host = {
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.smartCalibrate();
+    $('#micDev').onchange = (e) => { try { localStorage.setItem('sm-mic', e.target.value); } catch {} };
+    $('#micDevRefresh').onclick = () => this.listMics(true);
+    $('#calibMic').addEventListener('change', () => { $('#micDevRow').style.display = $('#micDevHint').style.display = $('#calibMic').value === 'self' ? '' : 'none'; });
+    this.listMics(false);
+    navigator.mediaDevices?.addEventListener?.('devicechange', () => this.listMics(false));
     $('#profileBtn').onclick = () => this.profileDevices();
     $('#bandGlue').oninput = (e) => { H.bandGlue = Number(e.target.value) / 100; $('#bandGlueVal').textContent = e.target.value + '%'; this.changed(); };
     $('#checkBtn').onclick = () => this.checkAssign();
@@ -879,7 +884,7 @@ const host = {
   async openMic(micId) {
     if (micId === 'self') {
       const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
-      const recorder = new MicRecorder(ctx, hostNow);
+      const recorder = new MicRecorder(ctx, hostNow, this.micDevice());
       await recorder.start();
       return { recorder };
     }
@@ -955,7 +960,7 @@ const host = {
       let client = null;
       if (micId === 'self') {
         const ctx = this.selfEngine?.ctx || (this.calCtx ||= new (window.AudioContext || window.webkitAudioContext)());
-        recorder = new MicRecorder(ctx, hostNow); await recorder.start();
+        recorder = new MicRecorder(ctx, hostNow, this.micDevice()); await recorder.start();
       } else ({ client } = await this.openMic(micId));
       const gap = 800, n = devs.length, T0 = hostNow() + 1200;
       const slots = [];
@@ -1046,6 +1051,23 @@ const host = {
       if (recorder) try { recorder.stop(); } catch {}
       this.calibrating = false; $('#profileBtn').disabled = false;
     }
+  },
+
+  // 这台电脑用哪个麦克风录音（存在本机，不跟着房间走）
+  micDevice() { try { return localStorage.getItem('sm-mic') || ''; } catch { return ''; } },
+  // 列出电脑上的麦克风；浏览器要先允许过一次麦克风才看得到名字（ask = true 时会请求一次）
+  async listMics(ask) {
+    try {
+      let list = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
+      if (ask && list.every((d) => !d.label)) {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true }); s.getTracks().forEach((t) => t.stop());
+        list = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
+      }
+      const sel = $('#micDev'), cur = this.micDevice();
+      sel.innerHTML = '<option value="">系统默认麦克风</option>' + list.filter((d) => d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications')
+        .map((d, i) => `<option value="${esc(d.deviceId)}">${esc(d.label || `麦克风 ${i + 1}（按 🔄 显示名称）`)}</option>`).join('');
+      sel.value = [...sel.options].some((o) => o.value === cur) ? cur : '';
+    } catch (e) { if (ask) toast('没办法读取麦克风列表：' + (e.message || e.name)); }
   },
 
   // 一台设备排定的总延迟（按位置的延迟 + 延迟微调），和设备那边 plan.D 一样
@@ -1540,6 +1562,7 @@ const host = {
       sel.innerHTML = '<option value="self">这台电脑的麦克风</option>' + online.filter((d) => d.id !== 'self').map((d) => `<option value="${esc(d.id)}">${esc(d.name)} 的麦克风</option>`).join('');
       if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
     }
+    $('#micDevRow').style.display = $('#micDevHint').style.display = $('#calibMic').value === 'self' ? '' : 'none';
     $('#devCount').textContent = `${online.length} 在线`;
     $('#noDev').style.display = devs.length ? 'none' : '';
     $('#clearOffline').hidden = !devs.some((d) => !d.online);
