@@ -1154,7 +1154,13 @@ const host = {
       // 第 1 步：用音乐测出每台设备实际出声的时刻（在粗测结果附近 ±40ms 内找）
       const rows = await this.musicPass(devs, micId, 40, out, '第 1 步：测量');
       const pm = this.plans(), good = rows.filter((r) => r.ok);
-      if (!good.length) throw new Error('没有比对成功：换一段持续有声音的歌、把录音设备放近一点、周围安静一点再试');
+      if (!good.length) {
+        // 音乐比对都没成功：保留“啾”声的结果（已经校准好了），并列出每台的情况方便排查
+        out(`⚠️ 音乐比对没成功，已保留“啾”声校准的结果（各设备已经对齐，只是没有再用音乐精修）。
+          <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td><td class="muted">录到的音量 ${r.levelDb ?? '?'} dB · 比对清晰度 ${r.clarity ? r.clarity.toFixed(1) : '?'}${r.agree === false ? ' · 前后不一致' : ''}</td></tr>`).join('')}</table>
+          <div class="muted">常见原因：录到的音量太小（低于 -60 dB：把喇叭音量调大、麦克风靠近一点）；歌里安静的段落太多（换一首一直有声音的）；电脑自己也在放原声。截图给我也可以帮你看。</div>`);
+        return;
+      }
       this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
       for (const r of good) r.real = r.val - this.totalD(r.d, pm); // 这台设备真实的延迟（浏览器不知道的那部分）
       // 让每台设备在你的位置同时出声：以最慢的为准，其他设备等它（微调都 ≥ 0）

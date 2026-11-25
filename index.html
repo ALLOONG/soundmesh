@@ -3523,11 +3523,18 @@ function alignMusic(mic, windows, getSrc, rate, search) {
     const x = getSrc(xFrom, n, rate);
     if (!x) return { did: w.did, ok: false };
     let e2 = 0; for (const v of y) e2 += v * v;
-    const g = gccPhat(y, x, Math.round(((2 * S) / 1000) * rate), rate);
+    const maxLag = Math.round(((2 * S) / 1000) * rate);
+    const g = gccPhat(y, x, maxLag, rate);
+    // 前后两半各比对一次：两半的结果一致，就代表对到的是真的（比只看峰有多尖可靠，房间回音大也不怕）
+    const h = Math.floor(y.length / 2);
+    const g1 = gccPhat(y.subarray(0, h), x.subarray(0, h + maxLag), maxLag, rate);
+    const g2 = gccPhat(y.subarray(h), x.subarray(h, h + (y.length - h) + maxLag), maxLag, rate);
+    const agree = Math.abs(g1.lag - g.lag) < 0.0004 * rate && Math.abs(g2.lag - g.lag) < 0.0004 * rate;
     // y[0]（时刻 a）对应原声 xFrom + lag/rate → 听到时刻 - 原声时间
     const offset = w.a - (xFrom + (g.lag / rate) * 1000) - (mic.inLat || 0) * 1000;
-    const quiet = Math.sqrt(e2 / y.length) < 0.002;
-    return { did: w.did, ok: !quiet && g.clarity > 8, offset, clarity: g.clarity, other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
+    const rms = Math.sqrt(e2 / y.length), quiet = rms < 0.0002; // 约 -74dB：关掉自动增益后耳机麦克风录到的音量本来就小
+    const ok = !quiet && (g.clarity > 8 || (g.clarity > 3.5 && agree));
+    return { did: w.did, ok, offset, clarity: g.clarity, agree, levelDb: Math.round(20 * Math.log10(rms + 1e-9)), other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
   });
 }
 
@@ -6400,7 +6407,13 @@ const host = {
       // 第 1 步：用音乐测出每台设备实际出声的时刻（在粗测结果附近 ±40ms 内找）
       const rows = await this.musicPass(devs, micId, 40, out, '第 1 步：测量');
       const pm = this.plans(), good = rows.filter((r) => r.ok);
-      if (!good.length) throw new Error('没有比对成功：换一段持续有声音的歌、把录音设备放近一点、周围安静一点再试');
+      if (!good.length) {
+        // 音乐比对都没成功：保留“啾”声的结果（已经校准好了），并列出每台的情况方便排查
+        out(`⚠️ 音乐比对没成功，已保留“啾”声校准的结果（各设备已经对齐，只是没有再用音乐精修）。
+          <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td><td class="muted">录到的音量 ${r.levelDb ?? '?'} dB · 比对清晰度 ${r.clarity ? r.clarity.toFixed(1) : '?'}${r.agree === false ? ' · 前后不一致' : ''}</td></tr>`).join('')}</table>
+          <div class="muted">常见原因：录到的音量太小（低于 -60 dB：把喇叭音量调大、麦克风靠近一点）；歌里安静的段落太多（换一首一直有声音的）；电脑自己也在放原声。截图给我也可以帮你看。</div>`);
+        return;
+      }
       this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
       for (const r of good) r.real = r.val - this.totalD(r.d, pm); // 这台设备真实的延迟（浏览器不知道的那部分）
       // 让每台设备在你的位置同时出声：以最慢的为准，其他设备等它（微调都 ≥ 0）

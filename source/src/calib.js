@@ -255,11 +255,18 @@ export function alignMusic(mic, windows, getSrc, rate, search) {
     const x = getSrc(xFrom, n, rate);
     if (!x) return { did: w.did, ok: false };
     let e2 = 0; for (const v of y) e2 += v * v;
-    const g = gccPhat(y, x, Math.round(((2 * S) / 1000) * rate), rate);
+    const maxLag = Math.round(((2 * S) / 1000) * rate);
+    const g = gccPhat(y, x, maxLag, rate);
+    // 前后两半各比对一次：两半的结果一致，就代表对到的是真的（比只看峰有多尖可靠，房间回音大也不怕）
+    const h = Math.floor(y.length / 2);
+    const g1 = gccPhat(y.subarray(0, h), x.subarray(0, h + maxLag), maxLag, rate);
+    const g2 = gccPhat(y.subarray(h), x.subarray(h, h + (y.length - h) + maxLag), maxLag, rate);
+    const agree = Math.abs(g1.lag - g.lag) < 0.0004 * rate && Math.abs(g2.lag - g.lag) < 0.0004 * rate;
     // y[0]（时刻 a）对应原声 xFrom + lag/rate → 听到时刻 - 原声时间
     const offset = w.a - (xFrom + (g.lag / rate) * 1000) - (mic.inLat || 0) * 1000;
-    const quiet = Math.sqrt(e2 / y.length) < 0.002;
-    return { did: w.did, ok: !quiet && g.clarity > 8, offset, clarity: g.clarity, other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
+    const rms = Math.sqrt(e2 / y.length), quiet = rms < 0.0002; // 约 -74dB：关掉自动增益后耳机麦克风录到的音量本来就小
+    const ok = !quiet && (g.clarity > 8 || (g.clarity > 3.5 && agree));
+    return { did: w.did, ok, offset, clarity: g.clarity, agree, levelDb: Math.round(20 * Math.log10(rms + 1e-9)), other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
   });
 }
 
