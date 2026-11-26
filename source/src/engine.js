@@ -316,9 +316,19 @@ export class Engine extends EventTarget {
     if (ts && ts.performanceTime > 0 && this.ctx.state === 'running') {
       // 手机浏览器给的“播放时间”每次会跳几毫秒：不直接用，而是平滑成一条稳定的对应关系
       // （声卡和系统时钟的快慢差会被慢慢跟上；突然变很多——比如切后台回来——就直接采用新值）
+      // 以前：单一次读数和现在差超过 20ms 就直接采用 → 偶尔一次离谱的读数会让整台设备的时间跳 10 多 ms，
+      // 再慢慢滑回来（校准完显示对齐、实际听起来某台早/晚、每次结果不同，都是这个造成的）。
+      // 现在：取最近 3 秒所有读数的中位数（不怕个别离谱值），只有中位数本身变了 20ms 以上才当作真的变了。
       const pn = performance.now(), off = ts.contextTime - ts.performanceTime / 1000;
-      if (this.mapOff === undefined || Math.abs(off - this.mapOff) > 0.02) this.mapOff = off;
-      else this.mapOff += (off - this.mapOff) * 0.03;
+      const W = this.offWin || (this.offWin = []);
+      W.push([pn, off]); while (W.length > 1 && pn - W[0][0] > 3000) W.shift();
+      if (this.mapOff === undefined || pn - (this.offAt || 0) > 100) {
+        const s = W.map((x) => x[1]).sort((a, b) => a - b), med = s[s.length >> 1];
+        // 中位数变了 1ms 以上＝真的变了（例如音频卡了一下、少放了一段）：马上采用，不要慢慢跟
+        if (this.mapOff === undefined || Math.abs(med - this.mapOff) > 0.001) this.mapOff = med;
+        else this.mapOff += (med - this.mapOff) * 0.1;
+        this.offAt = pn;
+      }
       return this.mapOff + pn / 1000;
     }
     return this.ctx.currentTime - (this.ctx.outputLatency || this.ctx.baseLatency || 0);
@@ -629,9 +639,16 @@ export class Engine extends EventTarget {
     // 缓冲（所有设备一起）自动微调时照旧慢慢滑，听不出来
     const tgt = cur.plan.D, tg = this.liveTgt || (this.liveTgt = new Map()), prevT = tg.get(srcName);
     tg.set(srcName, tgt);
-    const jump = prevT !== undefined && Math.abs(tgt - prevT) > 2;
+    const jump = prevT !== undefined && Math.abs(tgt - prevT) > 0.2; // 校准最后几轮常常只改零点几～2ms，也要马上生效
+    // 实际播放位置和应有位置差超过 3ms（音频卡顿、系统忙了一下）：直接跳回正确位置。
+    // 以前是每秒慢慢追 1–3ms，卡一下 10ms 就要十几秒才对齐，这段时间这台听起来就是早/晚
+    // 用平滑过的误差判断（单次读数会抖），而且 2 秒内最多跳一次
+    const eNow = cursor === null ? 0 : (ema.get(srcName) ?? -gap) * 0.95 + -gap * 0.05;
+    const lj = this.liveLastJump || (this.liveLastJump = new Map()), nowMs = performance.now();
+    const off3 = cursor !== null && Math.abs(eNow) > 0.003 * sr && nowMs - (lj.get(srcName) || 0) > 2000;
+    if (off3 || jump) lj.set(srcName, nowMs);
     let startF, fadeIn = 0;
-    if (cursor === null || jump || cursor < minF || gap < -0.04 * sr || gap > 0.25 * sr) {
+    if (cursor === null || jump || off3 || cursor < minF || gap < -0.04 * sr || gap > 0.25 * sr) {
       // 重新对齐（刚开始 / 网络卡太久之后 / 误差太大）：旧的在接点淡出，新的淡入
       startF = Math.max(expF, minF);
       if (cursor !== null) { p.port.postMessage({ cut: startF, fade: 192 }); this.liveStats.resyncs++; }
