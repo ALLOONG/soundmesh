@@ -3505,7 +3505,20 @@ function gccPhat(y, x, maxLag, rate) {
   for (let k = 0; k <= maxLag; k++) if (Math.abs(k - bi) > guard && yr[k] > second && yr[k] >= (yr[k - 1] ?? -Infinity) && yr[k] >= (yr[k + 1] ?? -Infinity)) { second = yr[k]; si = k; }
   const y0 = yr[bi - 1] ?? best, y2 = yr[bi + 1] ?? best, den = y0 - 2 * best + y2;
   const frac = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
-  return { lag: bi + frac, clarity: best / med, second: second > 0 ? second / best : 0, secondLag: si };
+  // 离最高峰 20ms 以外最高的峰：持续的长音、重复的节奏会在别的位置也有差不多高的峰（大范围搜索时就分不清哪个才对）
+  const far20 = Math.round(rate * 0.02); let far = 0;
+  for (let k = 0; k <= maxLag; k++) if (Math.abs(k - bi) > far20 && yr[k] > far) far = yr[k];
+  // 第一个到达的峰：房间里墙壁的反射声可能比直达声还强，但一定比较晚到。
+  // 反射晚到 → lag 较小（lag 越大代表越早到）。所以从最高峰往“更早”那一侧找，
+  // 15ms 内只要有够高（≥ 最高峰 45%）的峰，就以最早的那个为准
+  let fi = bi;
+  const reach = Math.round(rate * 0.015), thr = best * 0.45;
+  for (let k = Math.min(maxLag - 1, bi + reach); k > bi; k--) {
+    if (yr[k] >= thr && yr[k] >= yr[k - 1] && yr[k] >= yr[k + 1]) { fi = k; break; }
+  }
+  const pk = yr[fi], z0 = yr[fi - 1] ?? pk, z2 = yr[fi + 1] ?? pk, dn = z0 - 2 * pk + z2;
+  const ff = dn ? Math.max(-0.5, Math.min(0.5, (0.5 * (z0 - z2)) / dn)) : 0;
+  return { lag: fi + ff, peakLag: bi + frac, far: far / best, clarity: best / med, second: second > 0 ? second / best : 0, secondLag: si };
 }
 
 // mic: { rec, sr, startHost, inLat }（rec 已经是 rate 采样率）
@@ -3525,19 +3538,28 @@ function alignMusic(mic, windows, getSrc, rate, search) {
     let e2 = 0; for (const v of y) e2 += v * v;
     const maxLag = Math.round(((2 * S) / 1000) * rate);
     const g = gccPhat(y, x, maxLag, rate);
-    // 前后两半各比对一次：两半的结果一致，就代表对到的是真的（比只看峰有多尖可靠，房间回音大也不怕）
-    const h = Math.floor(y.length / 2);
-    const g1 = gccPhat(y.subarray(0, h), x.subarray(0, h + maxLag), maxLag, rate);
-    const g2 = gccPhat(y.subarray(h), x.subarray(h, h + (y.length - h) + maxLag), maxLag, rate);
-    const agree = Math.abs(g1.lag - g.lag) < 0.0004 * rate && Math.abs(g2.lag - g.lag) < 0.0004 * rate;
+    // 分成三段各自比对：至少两段和整段结果一致（±1.5ms），才代表对到的是真的。
+    // 单纯的音调、重复的节奏会产生很尖但每段都不一样的“假峰”；房间回音只会造成零点几毫秒的小差异
+    const K = 3, seg = Math.floor(y.length / K), tol = 0.0015 * rate, segs = [];
+    for (let s = 0; s < K; s++) {
+      const gs = gccPhat(y.subarray(s * seg, (s + 1) * seg), x.subarray(s * seg, (s + 1) * seg + maxLag), maxLag, rate);
+      segs.push(gs);
+    }
+    // 每段可能对到直达声、也可能对到反射声，两者都是真的对上了（假峰不会刚好落在这两个位置）
+    const refs = [g.lag, g.peakLag], hit = (gs) => [gs.lag, gs.peakLag].some((l) => refs.some((r) => Math.abs(l - r) < tol));
+    const near = segs.filter(hit).length;
+    const agree = near >= 2;
+    const spreadMs = (Math.max(...segs.map((q) => q.lag)) - Math.min(...segs.map((q) => q.lag))) / rate * 1000;
     // y[0]（时刻 a）对应原声 xFrom + lag/rate → 听到时刻 - 原声时间
     const offset = w.a - (xFrom + (g.lag / rate) * 1000) - (mic.inLat || 0) * 1000;
     const rms = Math.sqrt(e2 / y.length), quiet = rms < 0.0002; // 约 -74dB：关掉自动增益后耳机麦克风录到的音量本来就小
     // 一定要前后两半吻合（真的对上时一定一致；单纯的音调、重复的节奏会产生很尖但不一致的“假峰”），
     // 而且峰不能落在搜索范围的最边缘（那通常是真正的位置在范围外）
     const edge = g.lag < 2 || g.lag > maxLag - 2;
-    const ok = !quiet && !edge && agree && g.clarity > 3.5;
-    return { did: w.did, ok, offset, clarity: g.clarity, agree, levelDb: Math.round(20 * Math.log10(rms + 1e-9)), other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
+    // 最高峰必须“独一无二”：20ms 外还有差不多高的峰 → 可能差了一拍/一个音的周期，不采用
+    const unique = g.far < 0.7; // 实测：真的对上 ≤ 0.6（回音很重的房间），差一个周期的假峰 ≥ 0.73
+    const ok = !quiet && !edge && agree && unique && g.clarity > 9; // 实测：真的对上 ≥ 13，完全对不上 ≤ 7.5
+    return { did: w.did, ok, offset, clarity: g.clarity, far: g.far, unique, agree, near, spreadMs, segs: segs.map((q) => (q.lag - g.lag) / rate * 1000), levelDb: Math.round(20 * Math.log10(rms + 1e-9)), other: g.second > 0.5 ? { ratio: g.second, ms: ((g.secondLag - g.lag) / rate) * 1000 } : null, quiet };
   });
 }
 
@@ -6358,7 +6380,7 @@ const host = {
     const known = (d) => (Number.isFinite(d.realLat) ? d.realLat : 0);
     await this.settle(out);
     const mic = await this.openMic(micId); // 先把麦克风打开（手机可能要一两秒），再安排各设备的出声时段
-    const LEN = 1500, GAP = 300, T0 = hostNow() + 1000;
+    const LEN = 2600, GAP = 300, T0 = hostNow() + 1000; // 每台 2.6 秒：切三段各自比对，每段要够长才稳
     const wins = devs.map((d, i) => {
       const from = T0 + i * (LEN + GAP), to = from + LEN, k = known(d);
       return { d, did: d.id, from, to, a: from + k + 300, b: to + k - 60, expect: H.liveDelay + this.totalD(d, pm) + k };
@@ -6393,6 +6415,7 @@ const host = {
     const get = (t, n, rr) => this.srcExcerpt(t, n, rr);
     const res = alignMusic(data, wins, get, rate, search);
     window.__smLastMusic = res.map((r) => ({ ...r })); // 排查用
+    window.__smMusicHist = [...(window.__smMusicHist || []).slice(-9), { search, res: window.__smLastMusic }];
     window.__smLastRaw = { startHost: data.startHost, n: data.rec.length, head: Array.from(data.rec.subarray(24000, 24400)) }; // 排查用
     // 全部静音的那段：还听得到同一首歌 → 有不受 SoundMesh 控制的声音（电脑原声等）
     const ec = findEarlyCopy(data, quietFrom + 500 + maxK, quietTo - 50, 0, 700, (t, n, rr) => this.srcExcerpt(t, n, rr), rate);
@@ -6421,23 +6444,24 @@ const host = {
     const r1 = (v) => Math.round(v * 10) / 10;
     try {
       out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
-      // 第 1 步：用音乐测出每台设备实际出声的时刻（在粗测结果附近 ±40ms 内找）
-      let rows = await this.musicPass(devs, micId, 40, out, '第 1 步：测量');
-      // 有设备没对上（又不是没声音）：多半是它的延迟和上次差很多（刷新过页面、蓝牙延迟变了）。
-      // 音乐会重复，大范围找容易对错位置；改用“啾”声只给这几台重新粗测，再用音乐精确对齐一次
-      const lost = rows.filter((r) => !r.ok && !r.quiet).map((r) => r.d);
+      // 第 1 步：用音乐测出每台设备实际出声的时刻。一律在 ±400ms 的大范围里找：
+      // 如果只在小范围找，而真正的位置刚好在范围外，长音/重复节奏的“假峰”就会被当成答案；
+      // 大范围里真正的峰会远远高过假峰，再加上“独一无二”和三段吻合的检查，不会对错
+      let rows = await this.musicPass(devs, micId, 400, out, '第 1 步：测量');
+      let lost = rows.filter((r) => !r.ok && !r.quiet).map((r) => r.d);
+      // 还是找不到：改用“啾”声只给这几台重新粗测，再用音乐精确对齐一次
       if (lost.length) {
         const ch = await this.measureChirps(lost, micId, 3, out, `${lost.map((d) => d.name).join('、')} 的延迟好像变了，用“啾”声重新粗测`, true);
         const pc = this.plans();
         for (const r of ch) if (r.val !== null) r.d.realLat = r1(r.val - (pc[r.d.id]?.delayMs || 0)); // “啾”声不套用延迟微调，量到的就是真实延迟
-        if (ch.some((r) => r.val !== null)) rows = await this.musicPass(devs, micId, 40, out, '第 1 步：重新测量');
+        if (ch.some((r) => r.val !== null)) rows = await this.musicPass(devs, micId, 400, out, '第 1 步：重新测量');
       }
       const pm = this.plans(), good = rows.filter((r) => r.ok);
       if (!good.length) {
         // 音乐比对都没成功：保留“啾”声的结果（已经校准好了），并列出每台的情况方便排查
         out(`⚠️ 音乐比对没成功，${chirped ? '已保留刚才“啾”声校准的结果（各设备已经对齐，只是没有再用音乐精修）' : '各设备的设置没有改动'}。
-          <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td><td class="muted">录到的音量 ${r.levelDb ?? '?'} dB · 比对清晰度 ${r.clarity ? r.clarity.toFixed(1) : '?'}${r.agree === false ? ' · 前后不一致' : ''}</td></tr>`).join('')}</table>
-          <div class="muted">常见原因：录到的音量太小（低于 -60 dB：把喇叭音量调大、麦克风靠近一点）；歌里安静的段落太多（换一首一直有声音的）；电脑自己也在放原声。截图给我也可以帮你看。</div>`);
+          <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td><td class="muted">录到的音量 ${r.levelDb ?? '?'} dB · 比对清晰度 ${r.clarity ? r.clarity.toFixed(1) : '?'}${r.near !== undefined ? ` · 三段吻合 ${r.near}/3` : ''}</td></tr>`).join('')}</table>
+          <div class="muted">清晰度 9 以上才算对上，7 以下代表录到的声音和原曲完全对不起来。常见原因：录到的音量太小（低于 -60 dB：把喇叭音量调大、麦克风靠近一点）；歌里安静的段落太多（换一首一直有声音的）；电脑自己也在放原声。截图给我也可以帮你看。</div>`);
         return;
       }
       this.calUndo = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
