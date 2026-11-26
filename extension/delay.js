@@ -1,4 +1,4 @@
-// 在 YouTube 页面里运行：在原视频上盖一层画布，显示“D 毫秒以前”的画面，
+// 在任何网站（包括嵌在 iframe 里的播放器）运行：在原视频上盖一层画布，显示“D 毫秒以前”的画面，
 // 让画面和 SoundMesh 播到手机/平板上的声音对齐。点击、全屏、字幕都照常（画布不拦截鼠标）。
 (() => {
   let cfg = { enabled: true, trim: 0 }, info = null;
@@ -39,9 +39,16 @@
     cbId = v.requestVideoFrameCallback(onFrame);
   }
 
+  // 选“正在播放、面积最大”的那个影片（影音网站常有广告、预告、小窗影片）
   function findVideo() {
-    const v = document.querySelector('video.html5-main-video') || document.querySelector('#movie_player video') || document.querySelector('video');
-    if (v && 'requestVideoFrameCallback' in v) attach(v);
+    if (!delayMs()) return; // SoundMesh 没在用：什么都不做，不影响网页
+    let best = null, area = 0;
+    for (const v of document.querySelectorAll('video')) {
+      if (!('requestVideoFrameCallback' in v)) continue;
+      const a = v.clientWidth * v.clientHeight * (v.paused ? 0.1 : 1);
+      if (a > area && v.clientWidth >= 300) { area = a; best = v; } // 太小的（广告、预览）不管
+    }
+    if (best) attach(best);
   }
   setInterval(findVideo, 1000); findVideo();
 
@@ -56,14 +63,22 @@
     // 跟着原视频的位置和大小走（全屏、影院模式、小窗都对得上）
     const s = canvas.style, l = video.offsetLeft + 'px', tp = video.offsetTop + 'px', w = video.clientWidth + 'px', h = video.clientHeight + 'px';
     if (s.left !== l) s.left = l; if (s.top !== tp) s.top = tp; if (s.width !== w) s.width = w; if (s.height !== h) s.height = h;
+    const cs = getComputedStyle(video), z = cs.zIndex === 'auto' ? '' : cs.zIndex;
+    if (s.zIndex !== z) s.zIndex = z;
     if (!pick) return;
-    if (canvas.width !== pick.bmp.width || canvas.height !== pick.bmp.height) { canvas.width = pick.bmp.width; canvas.height = pick.bmp.height; }
-    ctx.drawImage(pick.bmp, 0, 0, canvas.width, canvas.height);
+    // 画布大小 = 影片元素在屏幕上的大小；画面照播放器的方式摆（预设等比例、上下或左右留黑边），不会被拉长
+    const dpr = Math.min(2, window.devicePixelRatio || 1), cw = Math.max(1, Math.round(video.clientWidth * dpr)), ch = Math.max(1, Math.round(video.clientHeight * dpr));
+    if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+    const bw = pick.bmp.width, bh = pick.bmp.height, fit = cs.objectFit;
+    let dw = cw, dh = ch;
+    if (fit !== 'fill') { const k = fit === 'cover' ? Math.max(cw / bw, ch / bh) : Math.min(cw / bw, ch / bh); dw = bw * k; dh = bh * k; }
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch);
+    ctx.drawImage(pick.bmp, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
     shown?.bmp.close?.(); shown = pick;
     if (s.display === 'none') s.display = 'block';
   }
   requestAnimationFrame(draw);
 
   // 给弹窗看现在的状态
-  setInterval(() => { try { chrome.storage.local.set({ smYt: { t: Date.now(), on: !!(canvas && canvas.style.display !== 'none'), broken, D: delayMs() } }); } catch {} }, 1000);
+  setInterval(() => { if (!video) return; try { chrome.storage.local.set({ smYt: { t: Date.now(), on: !!(canvas && canvas.style.display !== 'none'), broken, D: delayMs() } }); } catch {} }, 1000);
 })();

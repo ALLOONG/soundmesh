@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SoundMesh 画面延后",
-  "version": "1.2.0",
-  "description": "在 YouTube 里把画面自动延后，和 SoundMesh 的声音对齐；也能直接把分页声音送进 SoundMesh（没有共享提示条）。",
+  "version": "1.3.0",
+  "description": "在任何网站（YouTube、各种影音网站）把画面自动延后，和 SoundMesh 的声音对齐；也能直接把分页声音送进 SoundMesh（没有共享提示条）。",
   "permissions": [
     "storage",
     "tabCapture"
@@ -30,14 +30,17 @@
     },
     {
       "matches": [
-        "https://www.youtube.com/*",
-        "https://m.youtube.com/*",
-        "https://music.youtube.com/*"
+        "<all_urls>"
+      ],
+      "exclude_matches": [
+        "https://alloong.github.io/soundmesh/*"
       ],
       "js": [
         "delay.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_origin_as_fallback": true
     }
   ],
   "host_permissions": [
