@@ -450,23 +450,33 @@ export function findCodes({ rec, sr, startHost, inLat = 0 }, plans, lo, hi) {
       for (const ts of p.ts) { const v = at(ts + c); sum += v; if (v < mn) mn = v; }
       cands.push([c, sum + mn * p.ts.length]);
     }
-    let best = cands[0]; for (const q of cands) if (q[1] > best[1]) best = q;
+    let top = cands[0]; for (const q of cands) if (q[1] > top[1]) top = q;
+    // 真实房间的回音很长：直达声之后几十～几百 ms 还有很强的反射，梳状匹配在“更晚”的位置也会有高分。直达声一定最早到。
+    // 几道反射叠在一起可能比直达声还大声：在最高分之前 50ms 内（直达声不可能早更多），找最早达到最高分一半的
+    let best = top;
+    for (let k = 1; k < cands.length - 1; k++) {
+      const q = cands[k];
+      if (q[0] < top[0] - 50) continue;
+      if (q[0] >= top[0]) break;
+      if (q[1] >= top[1] * 0.5 && q[1] >= cands[k - 1][1] && q[1] >= cands[k + 1][1]) { best = q; break; }
+    }
     // 第二高的候选（离最佳 60ms 以外；墙壁反射只会在 0–30ms 内造成次峰，那不算模糊）
-    let second = 0; for (const q of cands) if (Math.abs(q[0] - best[0]) > 60 && q[1] > second) second = q[1];
+    // 模糊度：只看比选中位置“更早” 60ms 以上的候选（更晚的是回音，不算模糊）
+    let second = 0; for (const q of cands) if (q[0] < best[0] - 60 && q[1] > second) second = q[1];
     const sc = cands.map((q) => q[1]).sort((a, b) => a - b), med = sc[sc.length >> 1] || 1e-12;
-    // 逐次精确定位：在 ts[k]+c 附近 ±2ms 找最高峰，再往前 4ms 找“最早到达”的直达声（后面的是反射）
+    // 逐次精确定位：在 ts[k]+c 附近 ±2ms 找最高峰，再往前 6ms 找“最早到达”、够大声（≥50%）的直达声（后面的是反射）
     const reps = p.ts.map((ts) => {
       const ctr = Math.round(toIdx(ts + best[0])), w2 = Math.round(sr * 0.002);
       let bi = -1, bv = 0;
       for (let i = Math.max(1, ctr - w2); i <= Math.min(L - 2, ctr + w2); i++) if (env[i] > bv) { bv = env[i]; bi = i; }
       if (bi < 0) return { val: null, ratio: 0 };
       let pk = bi;
-      for (let i = Math.max(1, bi - Math.round(sr * 0.004)); i < bi; i++) if (env[i] >= bv * 0.6 && env[i] >= env[i - 1] && env[i] >= env[i + 1]) { pk = i; break; }
+      for (let i = Math.max(1, bi - Math.round(sr * 0.006)); i < bi; i++) if (env[i] >= bv * 0.5 && env[i] >= env[i - 1] && env[i] >= env[i + 1]) { pk = i; break; }
       const y0 = env[pk - 1], y1 = env[pk], y2 = env[pk + 1], den = y0 - 2 * y1 + y2;
       const fr = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
       return { val: toT(pk + fr) - ts, ratio: y1 / noise };
     });
-    let secondC = null; for (const q of cands) if (Math.abs(q[0] - best[0]) > 60 && q[1] === second) secondC = q[0];
+    let secondC = null; for (const q of cands) if (q[0] < best[0] - 60 && q[1] === second) secondC = q[0];
     return { did: p.did, c: best[0], secondC, clarity: best[1] / med, unique: second / best[1], reps };
   });
 }

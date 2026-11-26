@@ -1247,7 +1247,7 @@ const host = {
   // ================= 校准（重新设计）=================
   // 原理：把“啾”声直接放进实时串流里，跟音乐走完全一样的路（编码、网络、播放缓冲、延迟微调、喇叭），
   // 各设备轮流出声、同一个麦克风录下来，只比较“各设备彼此之间”谁早谁晚——不需要知道任何一台的绝对延迟，
-  // 也不依赖任何延迟公式。按差多少直接调整微调，再量一次确认；没对齐就继续修，直到全部在 0.5ms 以内（闭环）。
+  // 也不依赖任何延迟公式。按差多少直接调整微调，再量一次确认；没对齐就继续修，直到全部在 1ms 以内（闭环）。
 
   // 校准音产生器：接管 live 串流，每 20ms 产生一段，只有排到的那台设备的那一段才有“啾”声，其余是静音
   calStreamStart(devs, sched = [], codeFn = null) {
@@ -1329,14 +1329,14 @@ const host = {
     const res = findCodes(data, plans, lo, hi);
     window.__smLastStream = res; window.__smStreamHist = [...(window.__smStreamHist || []).slice(-9), res]; // 排查用
     return devs.map((d, i) => {
-      const f = res[i], heardR = f.reps.filter((x) => x.val !== null && x.ratio > 6);
+      const f = res[i], heardR = f.reps.filter((x) => x.val !== null && x.ratio > 4);
       const vals = heardR.map((x) => x.val), m = median(vals);
-      const close = vals.filter((v) => m !== null && Math.abs(v - m) <= 1);
-      // 4 次里至少 3 次互相吻合（1ms 内），而且梳状匹配的峰要明显、独一无二
+      // 真实手机每次出声本来就会差 1–2ms：4 次里至少 3 次在 2ms 内吻合，取中位数
+      const close = vals.filter((v) => m !== null && Math.abs(v - m) <= 2);
       const good = close.length >= Math.max(2, Math.ceil(reps * 0.75)) && f.clarity > 4 && f.unique < 0.8;
       // 粗略值：梳状匹配很明确、但 4 次不够一致时（例如和别台的声音重叠），先拿来做第一次粗调，之后几轮再精修
-      const rough = !good && heardR.length >= 2 && f.clarity > 8 && f.unique < 0.6 ? m : null;
-      return { d, ok: good, rough, val: good ? close.reduce((a, v) => a + v, 0) / close.length : null, heard: heardR.length, of: reps, spread: close.length > 1 ? Math.max(...close) - Math.min(...close) : null, clarity: f.clarity, unique: f.unique, ratio: Math.max(0, ...f.reps.map((x) => x.ratio)) };
+      const rough = !good && heardR.length >= 2 && f.clarity > 5 && f.unique < 0.8 ? m : null;
+      return { d, ok: good, rough, val: good ? median(close) : null, heard: heardR.length, of: reps, spread: close.length > 1 ? Math.max(...close) - Math.min(...close) : null, clarity: f.clarity, unique: f.unique, ratio: Math.max(0, ...f.reps.map((x) => x.ratio)) };
     });
   },
 
@@ -1382,7 +1382,7 @@ const host = {
         // 记录真实延迟（给画面同步用）：听到时刻 - 串流时间 - 缓冲 - 排定的延迟
         const pm = this.plans();
         for (const r of good) r.d.realLat = r1(r.val - H.liveDelay - this.totalD(r.d, pm));
-        if (spread <= 0.5) { done = true; break; }
+        if (spread <= 1) { done = true; break; } // 1ms 以内：比人耳分得出来的还小，而且真实设备每次本来就会差 1ms 左右
         // 连续三轮都没有变好（而且还差 2ms 以上）：设备可能没有照新的微调出声，停下来回报
         if (hist.length >= 4 && hist.slice(-3).every((v, k, a) => k === 0 || v > a[k - 1] * 0.8) && hist[hist.length - 1] > 2) { stuck = true; break; }
         // 以最晚的那台为准，其他设备各自延后“比它早多少”
@@ -1400,11 +1400,11 @@ const host = {
       const lE = rows ? Math.max(...rows.filter((r) => r.ok).map((r) => r.val), -Infinity) : 0;
       const why = (r) => r.heard === 0
         ? '没录到它的声音：确认它有在播放（没静音、音量够大），离麦克风近一点'
-        : `只听清楚 ${r.heard}/${r.of} 次（清晰度 ${r.clarity.toFixed(1)}）：周围太吵或回音太大，靠近一点再试`;
+        : `听清楚 ${r.heard}/${r.of} 次（清晰度 ${r.clarity.toFixed(1)}，模糊度 ${(r.unique ?? 0).toFixed(2)}），但不够一致：靠近一点、周围安静一点再试`;
       const table = `<table class="small" style="width:100%;margin-top:6px"><tr class="muted"><td>设备</td><td>校准前</td><td>校准后</td><td>微调</td></tr>${devs.map((d) => {
         const f = first.find((r) => r.d === d), l = last.get(d);
         const pre = f?.ok ? `${(fE - f.val) < 0.05 ? '最晚的那台' : `早 ${(fE - f.val).toFixed(1)} ms`}` : '—';
-        const post = l?.ok ? `${Math.abs(lE - l.val) <= 0.5 ? '✅' : '🔧'} ${(lE - l.val).toFixed(2)} ms` : `<span style="color:var(--bad)">没听到</span><div class="muted">${why(l || f)}</div>`;
+        const post = l?.ok ? `${Math.abs(lE - l.val) <= 1 ? '✅' : '🔧'} ${(lE - l.val).toFixed(2)} ms` : `<span style="color:var(--bad)">没听到</span><div class="muted">${why(l || f)}</div>`;
         return `<tr><td>${name(d)}</td><td>${pre}</td><td>${post}${l?.spread != null ? `<div class="muted">4 次测量相差 ${l.spread.toFixed(2)} ms</div>` : ''}</td><td class="muted">${before[d.id]} → ${d.latencyMs} ms</td></tr>`;
       }).join('')}</table>`;
       const trend = hist.length ? `<div class="muted">每一轮各设备之间最大差距：${hist.map((v) => v.toFixed(2) + ' ms').join(' → ')}</div>` : '';
@@ -1465,7 +1465,7 @@ const host = {
         out(`⚠️ 调整了但没有变化，可能有设备没有套用新设置。${table}${trend}<div class="muted">请截图给我。</div>`);
         this.calUndo = before; $('#calibUndo').hidden = false;
       } else if (hist.length) {
-        out(`⚠️ 调了 ${hist.length} 轮还没收敛到 0.5 ms 内（目前最多差 ${hist[hist.length - 1].toFixed(2)} ms）。${table}${trend}<div class="muted">可以再按一次继续；如果每次都差很多，请截图给我。</div>`);
+        out(`⚠️ 调了 ${hist.length} 轮还没收敛到 1 ms 内（目前最多差 ${hist[hist.length - 1].toFixed(2)} ms）。${table}${trend}<div class="muted">可以再按一次继续；如果每次都差很多，请截图给我。</div>`);
         this.calUndo = before; $('#calibUndo').hidden = false;
       } else {
         out(`⚠️ 需要至少两台设备被听清楚才能对齐。${table}`);

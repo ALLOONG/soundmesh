@@ -312,7 +312,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         <div class="small muted" id="micDevHint" style="margin-top:-6px">可以选耳机上的麦克风——电脑照样用喇叭外放（声音输出和录音是分开的）。校准时把耳机挂在耳朵旁边。</div>
         <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
         <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="alignTestBtn">🔔 对齐测试</button><button id="calibUndo" class="small" hidden>撤销</button></div>
-        <div class="small muted">💡 <b>怎么校准</b>：按“开始校准”后，音乐会暂停约 1–2 分钟，各设备轮流发出“沙沙”的校准音（每台的声音都不一样，不会认错）。校准音走的是和音乐<b>完全一样的路</b>，量的是各设备<b>彼此之间</b>谁早谁晚，调整后会<b>再量一次确认</b>，没对齐就继续修，直到都在 0.5 ms 以内。录音设备要放在<b>你耳朵的位置</b>，过程中请保持安静、不要移动设备。</div>
+        <div class="small muted">💡 <b>怎么校准</b>：按“开始校准”后，音乐会暂停约 1–2 分钟，各设备轮流发出“沙沙”的校准音（每台的声音都不一样，不会认错）。校准音走的是和音乐<b>完全一样的路</b>，量的是各设备<b>彼此之间</b>谁早谁晚，调整后会<b>再量一次确认</b>，没对齐就继续修，直到都在 1 ms 以内。录音设备要放在<b>你耳朵的位置</b>，过程中请保持安静、不要移动设备。</div>
         <div id="calibOut" class="small"></div>
         <hr style="border:0;border-top:1px solid var(--line);width:100%">
         <div class="small muted"><b>🔍 分工检查</b>：播放音乐时，各设备轮流单独出声约 2.6 秒，用同一个麦克风录下来，看每台<b>实际</b>放出来的是低音、人声中频、打击还是高频，确认分工有没有生效。</div>
@@ -3718,23 +3718,33 @@ function findCodes({ rec, sr, startHost, inLat = 0 }, plans, lo, hi) {
       for (const ts of p.ts) { const v = at(ts + c); sum += v; if (v < mn) mn = v; }
       cands.push([c, sum + mn * p.ts.length]);
     }
-    let best = cands[0]; for (const q of cands) if (q[1] > best[1]) best = q;
+    let top = cands[0]; for (const q of cands) if (q[1] > top[1]) top = q;
+    // 真实房间的回音很长：直达声之后几十～几百 ms 还有很强的反射，梳状匹配在“更晚”的位置也会有高分。直达声一定最早到。
+    // 几道反射叠在一起可能比直达声还大声：在最高分之前 50ms 内（直达声不可能早更多），找最早达到最高分一半的
+    let best = top;
+    for (let k = 1; k < cands.length - 1; k++) {
+      const q = cands[k];
+      if (q[0] < top[0] - 50) continue;
+      if (q[0] >= top[0]) break;
+      if (q[1] >= top[1] * 0.5 && q[1] >= cands[k - 1][1] && q[1] >= cands[k + 1][1]) { best = q; break; }
+    }
     // 第二高的候选（离最佳 60ms 以外；墙壁反射只会在 0–30ms 内造成次峰，那不算模糊）
-    let second = 0; for (const q of cands) if (Math.abs(q[0] - best[0]) > 60 && q[1] > second) second = q[1];
+    // 模糊度：只看比选中位置“更早” 60ms 以上的候选（更晚的是回音，不算模糊）
+    let second = 0; for (const q of cands) if (q[0] < best[0] - 60 && q[1] > second) second = q[1];
     const sc = cands.map((q) => q[1]).sort((a, b) => a - b), med = sc[sc.length >> 1] || 1e-12;
-    // 逐次精确定位：在 ts[k]+c 附近 ±2ms 找最高峰，再往前 4ms 找“最早到达”的直达声（后面的是反射）
+    // 逐次精确定位：在 ts[k]+c 附近 ±2ms 找最高峰，再往前 6ms 找“最早到达”、够大声（≥50%）的直达声（后面的是反射）
     const reps = p.ts.map((ts) => {
       const ctr = Math.round(toIdx(ts + best[0])), w2 = Math.round(sr * 0.002);
       let bi = -1, bv = 0;
       for (let i = Math.max(1, ctr - w2); i <= Math.min(L - 2, ctr + w2); i++) if (env[i] > bv) { bv = env[i]; bi = i; }
       if (bi < 0) return { val: null, ratio: 0 };
       let pk = bi;
-      for (let i = Math.max(1, bi - Math.round(sr * 0.004)); i < bi; i++) if (env[i] >= bv * 0.6 && env[i] >= env[i - 1] && env[i] >= env[i + 1]) { pk = i; break; }
+      for (let i = Math.max(1, bi - Math.round(sr * 0.006)); i < bi; i++) if (env[i] >= bv * 0.5 && env[i] >= env[i - 1] && env[i] >= env[i + 1]) { pk = i; break; }
       const y0 = env[pk - 1], y1 = env[pk], y2 = env[pk + 1], den = y0 - 2 * y1 + y2;
       const fr = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
       return { val: toT(pk + fr) - ts, ratio: y1 / noise };
     });
-    let secondC = null; for (const q of cands) if (Math.abs(q[0] - best[0]) > 60 && q[1] === second) secondC = q[0];
+    let secondC = null; for (const q of cands) if (q[0] < best[0] - 60 && q[1] === second) secondC = q[0];
     return { did: p.did, c: best[0], secondC, clarity: best[1] / med, unique: second / best[1], reps };
   });
 }
@@ -6628,7 +6638,7 @@ const host = {
   // ================= 校准（重新设计）=================
   // 原理：把“啾”声直接放进实时串流里，跟音乐走完全一样的路（编码、网络、播放缓冲、延迟微调、喇叭），
   // 各设备轮流出声、同一个麦克风录下来，只比较“各设备彼此之间”谁早谁晚——不需要知道任何一台的绝对延迟，
-  // 也不依赖任何延迟公式。按差多少直接调整微调，再量一次确认；没对齐就继续修，直到全部在 0.5ms 以内（闭环）。
+  // 也不依赖任何延迟公式。按差多少直接调整微调，再量一次确认；没对齐就继续修，直到全部在 1ms 以内（闭环）。
 
   // 校准音产生器：接管 live 串流，每 20ms 产生一段，只有排到的那台设备的那一段才有“啾”声，其余是静音
   calStreamStart(devs, sched = [], codeFn = null) {
@@ -6710,14 +6720,14 @@ const host = {
     const res = findCodes(data, plans, lo, hi);
     window.__smLastStream = res; window.__smStreamHist = [...(window.__smStreamHist || []).slice(-9), res]; // 排查用
     return devs.map((d, i) => {
-      const f = res[i], heardR = f.reps.filter((x) => x.val !== null && x.ratio > 6);
+      const f = res[i], heardR = f.reps.filter((x) => x.val !== null && x.ratio > 4);
       const vals = heardR.map((x) => x.val), m = median(vals);
-      const close = vals.filter((v) => m !== null && Math.abs(v - m) <= 1);
-      // 4 次里至少 3 次互相吻合（1ms 内），而且梳状匹配的峰要明显、独一无二
+      // 真实手机每次出声本来就会差 1–2ms：4 次里至少 3 次在 2ms 内吻合，取中位数
+      const close = vals.filter((v) => m !== null && Math.abs(v - m) <= 2);
       const good = close.length >= Math.max(2, Math.ceil(reps * 0.75)) && f.clarity > 4 && f.unique < 0.8;
       // 粗略值：梳状匹配很明确、但 4 次不够一致时（例如和别台的声音重叠），先拿来做第一次粗调，之后几轮再精修
-      const rough = !good && heardR.length >= 2 && f.clarity > 8 && f.unique < 0.6 ? m : null;
-      return { d, ok: good, rough, val: good ? close.reduce((a, v) => a + v, 0) / close.length : null, heard: heardR.length, of: reps, spread: close.length > 1 ? Math.max(...close) - Math.min(...close) : null, clarity: f.clarity, unique: f.unique, ratio: Math.max(0, ...f.reps.map((x) => x.ratio)) };
+      const rough = !good && heardR.length >= 2 && f.clarity > 5 && f.unique < 0.8 ? m : null;
+      return { d, ok: good, rough, val: good ? median(close) : null, heard: heardR.length, of: reps, spread: close.length > 1 ? Math.max(...close) - Math.min(...close) : null, clarity: f.clarity, unique: f.unique, ratio: Math.max(0, ...f.reps.map((x) => x.ratio)) };
     });
   },
 
@@ -6763,7 +6773,7 @@ const host = {
         // 记录真实延迟（给画面同步用）：听到时刻 - 串流时间 - 缓冲 - 排定的延迟
         const pm = this.plans();
         for (const r of good) r.d.realLat = r1(r.val - H.liveDelay - this.totalD(r.d, pm));
-        if (spread <= 0.5) { done = true; break; }
+        if (spread <= 1) { done = true; break; } // 1ms 以内：比人耳分得出来的还小，而且真实设备每次本来就会差 1ms 左右
         // 连续三轮都没有变好（而且还差 2ms 以上）：设备可能没有照新的微调出声，停下来回报
         if (hist.length >= 4 && hist.slice(-3).every((v, k, a) => k === 0 || v > a[k - 1] * 0.8) && hist[hist.length - 1] > 2) { stuck = true; break; }
         // 以最晚的那台为准，其他设备各自延后“比它早多少”
@@ -6781,11 +6791,11 @@ const host = {
       const lE = rows ? Math.max(...rows.filter((r) => r.ok).map((r) => r.val), -Infinity) : 0;
       const why = (r) => r.heard === 0
         ? '没录到它的声音：确认它有在播放（没静音、音量够大），离麦克风近一点'
-        : `只听清楚 ${r.heard}/${r.of} 次（清晰度 ${r.clarity.toFixed(1)}）：周围太吵或回音太大，靠近一点再试`;
+        : `听清楚 ${r.heard}/${r.of} 次（清晰度 ${r.clarity.toFixed(1)}，模糊度 ${(r.unique ?? 0).toFixed(2)}），但不够一致：靠近一点、周围安静一点再试`;
       const table = `<table class="small" style="width:100%;margin-top:6px"><tr class="muted"><td>设备</td><td>校准前</td><td>校准后</td><td>微调</td></tr>${devs.map((d) => {
         const f = first.find((r) => r.d === d), l = last.get(d);
         const pre = f?.ok ? `${(fE - f.val) < 0.05 ? '最晚的那台' : `早 ${(fE - f.val).toFixed(1)} ms`}` : '—';
-        const post = l?.ok ? `${Math.abs(lE - l.val) <= 0.5 ? '✅' : '🔧'} ${(lE - l.val).toFixed(2)} ms` : `<span style="color:var(--bad)">没听到</span><div class="muted">${why(l || f)}</div>`;
+        const post = l?.ok ? `${Math.abs(lE - l.val) <= 1 ? '✅' : '🔧'} ${(lE - l.val).toFixed(2)} ms` : `<span style="color:var(--bad)">没听到</span><div class="muted">${why(l || f)}</div>`;
         return `<tr><td>${name(d)}</td><td>${pre}</td><td>${post}${l?.spread != null ? `<div class="muted">4 次测量相差 ${l.spread.toFixed(2)} ms</div>` : ''}</td><td class="muted">${before[d.id]} → ${d.latencyMs} ms</td></tr>`;
       }).join('')}</table>`;
       const trend = hist.length ? `<div class="muted">每一轮各设备之间最大差距：${hist.map((v) => v.toFixed(2) + ' ms').join(' → ')}</div>` : '';
@@ -6846,7 +6856,7 @@ const host = {
         out(`⚠️ 调整了但没有变化，可能有设备没有套用新设置。${table}${trend}<div class="muted">请截图给我。</div>`);
         this.calUndo = before; $('#calibUndo').hidden = false;
       } else if (hist.length) {
-        out(`⚠️ 调了 ${hist.length} 轮还没收敛到 0.5 ms 内（目前最多差 ${hist[hist.length - 1].toFixed(2)} ms）。${table}${trend}<div class="muted">可以再按一次继续；如果每次都差很多，请截图给我。</div>`);
+        out(`⚠️ 调了 ${hist.length} 轮还没收敛到 1 ms 内（目前最多差 ${hist[hist.length - 1].toFixed(2)} ms）。${table}${trend}<div class="muted">可以再按一次继续；如果每次都差很多，请截图给我。</div>`);
         this.calUndo = before; $('#calibUndo').hidden = false;
       } else {
         out(`⚠️ 需要至少两台设备被听清楚才能对齐。${table}`);
