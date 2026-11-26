@@ -311,7 +311,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         <div class="row small" id="micDevRow"><span>用哪个麦克风</span><select id="micDev" class="grow"><option value="">系统默认麦克风</option></select><button id="micDevRefresh" class="small" title="列出这台电脑的所有麦克风">🔄</button></div>
         <div class="small muted" id="micDevHint" style="margin-top:-6px">可以选耳机上的麦克风——电脑照样用喇叭外放（声音输出和录音是分开的）。校准时把耳机挂在耳朵旁边。</div>
         <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
-        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="calibUndo" class="small" hidden>撤销</button></div>
+        <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="alignTestBtn">🔔 对齐测试</button><button id="calibUndo" class="small" hidden>撤销</button></div>
         <div class="small muted">💡 <b>怎么校准</b>：按“开始校准”后，音乐会暂停约 1–2 分钟，各设备轮流发出“沙沙”的校准音（每台的声音都不一样，不会认错）。校准音走的是和音乐<b>完全一样的路</b>，量的是各设备<b>彼此之间</b>谁早谁晚，调整后会<b>再量一次确认</b>，没对齐就继续修，直到都在 0.5 ms 以内。录音设备要放在<b>你耳朵的位置</b>，过程中请保持安静、不要移动设备。</div>
         <div id="calibOut" class="small"></div>
         <hr style="border:0;border-top:1px solid var(--line);width:100%">
@@ -6193,6 +6193,7 @@ const host = {
     $('#arc').onclick = () => { Object.values(H.devices).filter((d) => d.online).forEach((d, i) => Object.assign(d, arcSpot(i))); this.changed(); };
     $('#upload').onclick = () => this.addAudio();
     $('#calibBtn').onclick = () => this.smartCalibrate();
+    $('#alignTestBtn') && ($('#alignTestBtn').onclick = () => this.alignTest());
     $('#micDev').onchange = (e) => { try { localStorage.setItem('sm-mic', e.target.value); } catch {} };
     $('#micDevRefresh').onclick = () => this.listMics(true);
     $('#calibMic').addEventListener('change', () => { $('#micDevRow').style.display = $('#micDevHint').style.display = $('#calibMic').value === 'self' ? '' : 'none'; });
@@ -6630,14 +6631,14 @@ const host = {
   // 也不依赖任何延迟公式。按差多少直接调整微调，再量一次确认；没对齐就继续修，直到全部在 0.5ms 以内（闭环）。
 
   // 校准音产生器：接管 live 串流，每 20ms 产生一段，只有排到的那台设备的那一段才有“啾”声，其余是静音
-  calStreamStart(devs, sched = []) {
+  calStreamStart(devs, sched = [], codeFn = null) {
     this.calStreamStop();
     const FR = 960;
     const live = (did) => [...(this.need[did] || [])].filter((x) => x === 'live' || x.startsWith('live:'));
     const gen = { next: hostNow() - 20, byDid: {} };
     gen.setSched = (sc) => { gen.byDid = {}; for (const c of sc) (gen.byDid[c.did] ||= []).push(c.ts); };
     gen.setSched(sched);
-    const codes = Object.fromEntries(devs.map((d, i) => [d.id, makeCode(i, 48000)]));
+    const codes = Object.fromEntries(devs.map((d, i) => [d.id, codeFn ? codeFn(i, d) : makeCode(i, 48000)]));
     this.calGen = gen;
     // 串流原本在暂停（静音）中，设备会把声音淡出：先叫它们恢复
     this.link?.broadcast({ t: 'hush', on: false, at: gen.next }); this.selfEngine?.hush(false, gen.next); this.hushed = false; this.silentRun = 0;
@@ -6860,6 +6861,37 @@ const host = {
   },
 
   // 一个按钮：有音乐在播就用音乐校准（最准，测的就是你听到的），没有就用“啾”声
+  // 🔔 对齐测试：所有设备在同一瞬间各响一声“叮”（每台音高不同），每秒一次、共 15 下。
+  // 对齐：每下听起来是一个清脆的和弦；没对齐：会听到“嗒-叮”分成几下，音高告诉你是哪一台。走的和音乐完全同一条路。
+  async alignTest() {
+    if (this.calibrating) return;
+    if (H.currentGroupId !== 'live') return toast('先选“实时音源”并开始共享电脑声音，再做对齐测试');
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (devs.length < 2) return toast('至少要两台设备在线');
+    const FREQ = [523.25, 783.99, 1174.66, 1760, 2637.02, 3951.07]; // C5 G5 D6 A6 E7 B7：低到高，彼此是五度，叠在一起好听、也好分辨
+    const click = (i) => {
+      const f = FREQ[i % FREQ.length], n = Math.round(48000 * 0.06), x = new Float32Array(n);
+      for (let k = 0; k < n; k++) { const t = k / 48000; x[k] = Math.sin(2 * Math.PI * f * t) * Math.exp(-t * 60) * Math.min(1, k / 24) * 0.6; }
+      return x;
+    };
+    const out = (h) => ($('#calibOut').innerHTML = h);
+    this.calibrating = true; for (const b of ['#calibBtn', '#alignTestBtn', '#checkBtn']) $(b) && ($(b).disabled = true);
+    try {
+      this.calStreamStart(devs, [], click);
+      await sleep(1500);
+      const T0 = hostNow() + 600, sched = [];
+      for (let k = 0; k < 15; k++) for (const d of devs) sched.push({ did: d.id, ts: T0 + k * 1000 });
+      this.calGen.setSched(sched);
+      const legend = devs.map((d, i) => `<b>${esc(d.name)}</b> ${['最低音', '低音', '中音', '中高音', '高音', '最高音'][i] || ''}`).join('、');
+      out(`🔔 对齐测试中（约 16 秒）：每秒一下“叮”。<br>每下听起来是<b>一个清脆的和弦</b>＝对齐了；听到<b>“嗒-叮”分成两三下</b>＝没对齐，先响的那个音高就是比较早的设备。<br>音高：${legend}<div class="muted">也可以用手机在你坐的位置录下来传给我，我能算出每台差几毫秒。</div>`);
+      await sleep(T0 + 15000 + H.liveDelay + 1500 - hostNow());
+      out(`🔔 对齐测试结束。音高对照：${legend}<div class="muted">录音的话请传给我。</div>`);
+    } finally {
+      this.calStreamStop();
+      this.calibrating = false; for (const b of ['#calibBtn', '#alignTestBtn', '#checkBtn']) $(b) && ($(b).disabled = false);
+    }
+  },
+
   async smartCalibrate() {
     return this.streamCalibrate();
   },
