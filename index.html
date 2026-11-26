@@ -312,7 +312,7 @@ button.small.danger { color: var(--bad); background: var(--panel2); border-color
         <div class="small muted" id="micDevHint" style="margin-top:-6px">可以选耳机上的麦克风——电脑照样用喇叭外放（声音输出和录音是分开的）。校准时把耳机挂在耳朵旁边。</div>
         <div class="small muted">把录音设备放在 👑 听众位，所有设备音量调到正常大小，周围保持安静。</div>
         <div class="row"><button id="calibBtn" class="primary">开始校准</button><button id="calibUndo" class="small" hidden>撤销</button></div>
-        <div class="small muted">💡 <b>边放歌边按最准</b>：正在共享电脑声音、放着一首一直有声音的歌时，会直接用音乐校准（各设备轮流单独放 1.5 秒，测音乐真正到你耳朵的时间，还能发现电脑自己在放原声这类问题）；没在放歌时用“啾”声。录音设备要放在<b>你耳朵的位置</b>。</div>
+        <div class="small muted">💡 <b>边放歌边按最准</b>：正在共享电脑声音、放着一首一直有声音的歌时，会直接用音乐校准（各设备轮流单独放 2.6 秒，每台至少测两次、两次吻合才算数，套用后再验证到 0.3 ms 以内；约 40–60 秒，过程中请保持安静、不要移动设备）；没在放歌时用“啾”声。录音设备要放在<b>你耳朵的位置</b>。</div>
         <div id="calibOut" class="small"></div>
         <hr style="border:0;border-top:1px solid var(--line);width:100%">
         <div class="small muted"><b>🔍 分工检查</b>：播放音乐时，各设备轮流单独出声约 2.6 秒，用同一个麦克风录下来，看每台<b>实际</b>放出来的是低音、人声中频、打击还是高频，确认分工有没有生效。</div>
@@ -6447,14 +6447,32 @@ const host = {
       // 第 1 步：用音乐测出每台设备实际出声的时刻。一律在 ±400ms 的大范围里找：
       // 如果只在小范围找，而真正的位置刚好在范围外，长音/重复节奏的“假峰”就会被当成答案；
       // 大范围里真正的峰会远远高过假峰，再加上“独一无二”和三段吻合的检查，不会对错
-      let rows = await this.musicPass(devs, micId, 400, out, '第 1 步：测量');
+      // 第 1 步：每台设备至少测两次，两次相差 1ms 以内才算数（不一致就再加测一次，取吻合的那两次）。
+      // 要准不要快：宁可多花十几秒，也不要用一次碰巧的结果
+      const measure = async (tag) => {
+        const passes = [];
+        passes.push(await this.musicPass(devs, micId, 400, out, `第 1 步：测量${tag}（1/2）`));
+        passes.push(await this.musicPass(devs, micId, 400, out, `第 1 步：测量${tag}（2/2）`));
+        const settle = () => devs.map((d, i) => {
+          const all = passes.map((p) => p[i]), last = all[all.length - 1];
+          const vals = all.filter((r) => r.ok).map((r) => r.val), m = median(vals);
+          const close = vals.filter((v) => m !== null && Math.abs(v - m) < 1);
+          const ok = close.length >= 2;
+          const best = all.filter((r) => r.ok).sort((x, y) => y.clarity - x.clarity)[0] || last;
+          return { ...best, d, ok, quiet: all.every((r) => r.quiet), val: ok ? close.reduce((a2, v) => a2 + v, 0) / close.length : null, nOk: vals.length, spread: close.length > 1 ? Math.max(...close) - Math.min(...close) : null };
+        });
+        let rs = settle();
+        if (rs.some((r) => !r.ok && r.nOk >= 1)) { passes.push(await this.musicPass(devs, micId, 400, out, `第 1 步：两次结果不一致，加测一次`)); rs = settle(); }
+        return rs;
+      };
+      let rows = await measure('');
       let lost = rows.filter((r) => !r.ok && !r.quiet).map((r) => r.d);
-      // 还是找不到：改用“啾”声只给这几台重新粗测，再用音乐精确对齐一次
+      // 还是找不到：改用“啾”声只给这几台重新粗测，再用音乐精确对齐
       if (lost.length) {
         const ch = await this.measureChirps(lost, micId, 3, out, `${lost.map((d) => d.name).join('、')} 的延迟好像变了，用“啾”声重新粗测`, true);
         const pc = this.plans();
         for (const r of ch) if (r.val !== null) r.d.realLat = r1(r.val - (pc[r.d.id]?.delayMs || 0)); // “啾”声不套用延迟微调，量到的就是真实延迟
-        if (ch.some((r) => r.val !== null)) rows = await this.musicPass(devs, micId, 400, out, '第 1 步：重新测量');
+        if (ch.some((r) => r.val !== null)) rows = await measure('（重测）');
       }
       const pm = this.plans(), good = rows.filter((r) => r.ok);
       if (!good.length) {
@@ -6468,27 +6486,29 @@ const host = {
       for (const r of good) r.real = r.val - this.totalD(r.d, pm); // 这台设备真实的延迟（浏览器不知道的那部分）
       // 让每台设备在你的位置同时出声：以最慢的为准，其他设备等它（微调都 ≥ 0）
       const C = Math.max(...good.map((r) => (pm[r.d.id]?.delayMs || 0) + r.real));
-      let maxChange = 0;
       for (const r of good) {
         const nl = Math.max(0, Math.min(1000, r1(C - (pm[r.d.id]?.delayMs || 0) - r.real)));
-        // 和现在的差（扣掉大家一起平移的部分）：都很小就不用再验证一轮，省时间
         r.change = nl - r.d.latencyMs; r.d.realLat = r1(r.real); r.d.latencyMs = nl;
       }
-      const meanChange = good.reduce((a, r) => a + r.change, 0) / good.length;
-      maxChange = Math.max(...good.map((r) => Math.abs(r.change - meanChange)));
       this.changed(); this.lastWire = ''; this.publish();
-      let chk = [];
-      if (maxChange > 1) {
-        await sleep(2500); // 等新设置生效、设备追上
-        // 第 2 步：改动比较大，再测一次确认；还差的再修一次
-        chk = await this.musicPass(good.map((r) => r.d), micId, 25, out, '第 2 步：验证');
-      } else for (const r of good) { r.resid = r.change - meanChange; r.noVerify = true; } // 本来就差不多齐：这次的修正量就是原本的误差
-      const cg = chk.filter((r) => r.ok);
-      if (!chk.length) { /* 没有第 2 轮 */ }
-      for (const c of cg) {
-        const row = rows.find((r) => r.d === c.d);
-        row.resid = c.val - median(cg.map((x) => x.val));
-        if (Math.abs(row.resid) > 0.3) { c.d.latencyMs = r1(c.d.latencyMs - row.resid); row.fixed = true; }
+      // 第 2 步：一定验证。套用新设置后再用音乐测一次；还有设备差超过 0.3ms 就修正，再验证，最多 3 次
+      if (good.length >= 2) {
+        for (let it = 1; it <= 3; it++) {
+          await sleep(2500); // 等新设置生效、设备追上
+          const chk = await this.musicPass(good.map((r) => r.d), micId, 25, out, `第 2 步：验证（第 ${it} 次）`);
+          const cg = chk.filter((r) => r.ok);
+          if (cg.length < 2) break;
+          const mid = median(cg.map((x) => x.val));
+          let bad = 0;
+          for (const r of good) r.fixed = false;
+          for (const c of cg) {
+            const row = good.find((r) => r.d === c.d);
+            row.resid = c.val - mid; row.verifyRounds = it;
+            if (Math.abs(row.resid) > 0.3 && Math.abs(row.resid) < 30) { c.d.latencyMs = r1(c.d.latencyMs - row.resid); row.fixed = true; bad++; }
+          }
+          if (!bad) break;
+          this.changed(); this.lastWire = ''; this.publish();
+        }
       }
       const minLat = Math.min(...good.map((r) => r.d.latencyMs));
       if (minLat < 0) for (const r of good) r.d.latencyMs = r1(r.d.latencyMs - minLat);
@@ -6496,11 +6516,10 @@ const host = {
       const worst = Math.max(0, ...verified.map((r) => Math.abs(r.resid)));
       const others = rows.filter((r) => r.other && r.other.ratio > 0.6 && Math.abs(r.other.ms) > 3);
       const pcCopy = this.earlyCopy;
-      const nv = rows.some((r) => r.noVerify);
-      out(`✅ 用音乐校准完成${nv ? `：校准前各设备之间最多差 <b>${worst.toFixed(1)} ms</b>，已经修正（差得不多，所以没有再验证一轮）` : verified.length ? `：播放音乐时各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>` : ''}${rows.some((r) => r.fixed) ? '（个别设备已再修正，想确认可以再按一次）' : ''}
+      out(`✅ 用音乐校准完成${verified.length ? `：播放音乐时各设备之间误差 <b>${worst < 0.3 ? '0.3 ms 以内' : worst.toFixed(1) + ' ms'}</b>` : ''}${rows.some((r) => r.fixed) ? '（验证 3 次后个别设备仍有小误差，已修正；想再确认可以再按一次）' : ''}
         <table class="small" style="width:100%;margin-top:6px">${rows.map((r) => `<tr><td>${esc(r.d.name)}</td>
-          <td>${r.ok ? `真实延迟 ${r.real.toFixed(1)} ms` : `<span style="color:var(--bad)">没比对成功</span><div class="muted">${r.quiet ? '这段时间几乎没声音：换一段一直有声音的歌' : this.chirpWhy(r.d).replace('测试音', '音乐')}</div>`}</td>
-          <td>${r.resid === undefined ? (r.ok ? '验证没比对成功' : '未调整') : r.noVerify ? `原本差 ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms → 已修正` : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms`}</td>
+          <td>${r.ok ? `真实延迟 ${r.real.toFixed(1)} ms${r.spread !== null && r.spread !== undefined ? `<div class="muted">两次测量相差 ${r.spread.toFixed(2)} ms</div>` : ''}` : `<span style="color:var(--bad)">没比对成功</span><div class="muted">${r.quiet ? '这段时间几乎没声音：换一段一直有声音的歌' : this.chirpWhy(r.d).replace('测试音', '音乐')}</div>`}</td>
+          <td>${r.resid === undefined ? (r.ok ? '验证没比对成功' : '未调整') : `校准后 ${Math.abs(r.resid) < 0.3 ? '✅' : '🔧'} ${r.resid >= 0 ? '+' : ''}${r.resid.toFixed(1)} ms`}</td>
           <td class="muted">微调 → ${r.d.latencyMs} ms</td></tr>`).join('')}</table>
         ${pcCopy !== null && pcCopy !== undefined ? `<div style="color:var(--bad);margin-top:6px">⚠️ <b>还听到一份不经过 SoundMesh 的同一首歌</b>（几乎没有延迟，比所有设备早了好几百毫秒）。这通常是<b>电脑自己在放原声</b>：共享“整个屏幕”时电脑不会静音。它会和其他设备形成回音，校准也救不了——请改成共享 YouTube Music 那个<b>分页</b>（会自动静音），或把电脑的系统音量关掉。</div>` : ''}
         ${others.length ? `<div style="color:var(--warn,#f59f00);margin-top:4px">⚠️ 在 ${others.map((r) => esc(r.d.name)).join('、')} 单独出声的时候，还听到另一份同样的音乐（${others.map((r) => `${r.other.ms < 0 ? '早' : '晚'} ${Math.abs(r.other.ms).toFixed(0)} ms`).join('、')}）。通常是<b>电脑本身还在放原声</b>（共享整个屏幕时会这样）或有其他设备在放同一首歌——它不受 SoundMesh 控制，会听起来像回音。建议改成共享 YouTube 那个分页，或把电脑音量关掉。</div>` : ''}`);
