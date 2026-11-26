@@ -6,7 +6,7 @@ import { MultiHostLink, AutoNodeLink, packBin } from './transport.js';
 import { LiveCapture, LiveDecoder, opusDecodeSupported, pcmEncode, StreamEncoder, VideoMirror } from './live.js';
 import { Separator, STEMS, STEM_NAMES } from './separator.js';
 import { searchLyrics, parseLRC, lineAt } from './lyrics.js';
-import { MicRecorder, detectChirps, median, robustMean, analyzeWindows, toRate, alignMusic, findEarlyCopy, analyzeResponse, profileFromBands, SWEEP_SEC } from './calib.js';
+import { MicRecorder, makeCode, findCodes, detectChirps, median, robustMean, analyzeWindows, toRate, alignMusic, findEarlyCopy, analyzeResponse, profileFromBands, SWEEP_SEC } from './calib.js';
 
 // ---------------- 后台不降速的计时器 ----------------
 // 标签页切到后台后，浏览器会把 setTimeout/setInterval 降到每秒一次，静音页面 5 分钟后甚至每分钟一次。
@@ -321,8 +321,9 @@ const host = {
         this.changed();
       }
       // 自动调节：某台设备的音频分段开始“迟到”（来不及播），就把缓冲加大一点
+      // （校准中和刚结束的 5 秒不算：那是校准串流切换、分析录音时卡的那一下，不是网络或设备跟不上）
       const late = msg.stats?.live?.late;
-      if (H.autoDelay && !this.calibrating && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 3000) {
+      if (H.autoDelay && !this.calibrating && Date.now() - (this.calEndAt || 0) > 5000 && this.live.running && Number.isFinite(late) && Number.isFinite(prevLate) && late > prevLate + 2 && H.liveDelay < 3000) {
         this.safeFloor = Math.max(this.safeFloor || 0, H.liveDelay + 20); this.safeUntil = Date.now() + 180000; // 记住：3 分钟内别再压到这么低
         H.liveDelay = Math.min(3000, H.liveDelay + (H.videoMode ? 30 : 250)); // 看视频模式只回加一点点
         this.lastBump = Date.now();
@@ -399,6 +400,8 @@ const host = {
   needs(did, src) { return !!this.need[did]?.has(src); },
   anyNeeds(src) { return Object.values(this.need).some((set) => set.has(src)); },
   onLiveChunk({ frame, ts, l, r }) {
+    if (this.calGen) return; // 校准中：串流内容由校准音产生器接管
+    this.lastLiveTs = ts;
     const pn = performance.now();
     if (this.dg.lastChunkAt) this.dg.maxGap = Math.max(this.dg.maxGap, pn - this.dg.lastChunkAt);
     this.dg.lastChunkAt = pn; this.dg.chunks++;
@@ -425,13 +428,15 @@ const host = {
     if (H.currentGroupId !== 'live') return;
     // 电脑自己处理慢了多少：这段声音采集完到现在过了多久（玩游戏/最小化时 CPU 被抢走会变大）
     const lag = hostNow() - (ts + 20);
-    this.lagMax = Math.max(this.lagMax || 0, lag);
+    // 校准刚结束的 3 秒：电脑在分析录音时卡的那一下会让这几段晚到，不代表平常跟不上，不列入
+    if (Date.now() - (this.calEndAt || 0) > 3000) this.lagMax = Math.max(this.lagMax || 0, lag);
     const now = Date.now();
     if (now - (this.lagWin || 0) > 2000) {
       this.lagShown = this.lagMax; this.lagMax = 0; this.lagWin = now;
       // 处理延迟已经吃掉大部分缓冲 → 自动加大（留 150ms 给网络和手机）
       const margin = H.videoMode ? 25 : 150; // 看视频模式：只给网络和手机留 25ms
-      if (H.autoDelay && !this.calibrating && this.lagShown + margin > H.liveDelay && H.liveDelay < 3000) {
+      // 校准刚结束的 3 秒内不算（音乐刚接回来、校准分析时卡的那一下不代表电脑跟不上）
+      if (H.autoDelay && !this.calibrating && Date.now() - (this.calEndAt || 0) > 3000 && this.lagShown + margin > H.liveDelay && H.liveDelay < 3000) {
         H.liveDelay = Math.min(3000, Math.ceil((this.lagShown + margin + 30) / 10) * 10);
         this.lastBump = now;
         toast(`电脑处理跟不上（慢了 ${Math.round(this.lagShown)} ms），缓冲自动加到 ${H.liveDelay} ms`);
@@ -682,7 +687,7 @@ const host = {
     // 下限比现在的缓冲还高（比如刚改了延迟微调）：直接提上去，不等卡顿
     if (H.autoDelay && !this.calibrating && this.live.running && H.liveDelay < floor) { H.liveDelay = floor; this.changed(); }
     const calm = H.videoMode ? 6000 : 20000, every = H.videoMode ? 4000 : 10000;
-    if (H.autoDelay && this.live.running && H.liveDelay > floor && !anyHidden) {
+    if (H.autoDelay && !this.calibrating && this.live.running && H.liveDelay > floor && !anyHidden) {
       const now = Date.now();
       this.lastBump = this.lastBump || now;
       this.lastLower = this.lastLower || now;
@@ -1254,8 +1259,197 @@ const host = {
     }
   },
 
+  // ================= 校准（重新设计）=================
+  // 原理：把“啾”声直接放进实时串流里，跟音乐走完全一样的路（编码、网络、播放缓冲、延迟微调、喇叭），
+  // 各设备轮流出声、同一个麦克风录下来，只比较“各设备彼此之间”谁早谁晚——不需要知道任何一台的绝对延迟，
+  // 也不依赖任何延迟公式。按差多少直接调整微调，再量一次确认；没对齐就继续修，直到全部在 0.5ms 以内（闭环）。
+
+  // 校准音产生器：接管 live 串流，每 20ms 产生一段，只有排到的那台设备的那一段才有“啾”声，其余是静音
+  calStreamStart(devs, sched = []) {
+    this.calStreamStop();
+    const FR = 960;
+    const live = (did) => [...(this.need[did] || [])].filter((x) => x === 'live' || x.startsWith('live:'));
+    const gen = { next: hostNow() - 20, byDid: {} };
+    gen.setSched = (sc) => { gen.byDid = {}; for (const c of sc) (gen.byDid[c.did] ||= []).push(c.ts); };
+    gen.setSched(sched);
+    const codes = Object.fromEntries(devs.map((d, i) => [d.id, makeCode(i, 48000)]));
+    this.calGen = gen;
+    // 串流原本在暂停（静音）中，设备会把声音淡出：先叫它们恢复
+    this.link?.broadcast({ t: 'hush', on: false, at: gen.next }); this.selfEngine?.hush(false, gen.next); this.hushed = false; this.silentRun = 0;
+    const emit = (ts) => {
+      for (const d of devs) {
+        const L = new Float32Array(FR), list = gen.byDid[d.id] || [], chirp = codes[d.id] || codes[Object.keys(codes)[0]], CN = chirp.length;
+        for (const c0 of list) {
+          const off = Math.round(((c0 - ts) / 1000) * 48000); // 啾声第 0 个采样点在这一段的位置
+          if (off >= FR || off + CN <= 0) continue;
+          for (let i = Math.max(0, off); i < Math.min(FR, off + CN); i++) L[i] += chirp[i - off] * 0.5;
+        }
+        const planes = [L, L.slice()], srcs = live(d.id);
+        for (const src of srcs.length ? srcs : ['live']) {
+          if (d.id === 'self') {
+            if (!this.selfEngine) continue;
+            const buf = this.selfEngine.ctx.createBuffer(2, FR, 48000); buf.copyToChannel(planes[0], 0); buf.copyToChannel(planes[1], 1);
+            this.selfEngine.pushLive(ts, buf, src);
+          } else for (const c of this.link?.clients.values() || []) if (c.did === d.id) this.link.sendBin(c, packBin({ k: 'l', ts, c: 'p', sr: 48000, ch: 2, s: src }, pcmEncode(planes)));
+        }
+      }
+    };
+    // 提前 400ms 送出：控制端偶尔卡一下（分析录音、回收内存）也不会让设备断音（设备有缓冲，早到没关系）
+    gen.timer = setInterval(() => { let k = 0; while (this.calGen === gen && gen.next <= hostNow() + 400 && k++ < 40) { emit(gen.next); gen.next += 20; } }, 10);
+  },
+  calStreamStop() { if (this.calGen) { clearInterval(this.calGen.timer); this.calGen = null; this.calEndAt = Date.now(); this.lagMax = 0; this.lagWin = Date.now(); this.lagShown = 0; this.lagHist = []; } },
+
+  // 录音到控制端时间 end 为止（本机麦克风或其他设备的麦克风），返回 { rec, sr, startHost, inLat }
+  async recordUntil(mic, micId, end) {
+    let data;
+    if (mic.recorder) {
+      await sleep(end - hostNow());
+      const r = mic.recorder.stop(); data = { rec: r.rec, sr: r.sr, startHost: r.startHost, inLat: r.inLat || 0 };
+    } else {
+      this.recParts = {}; this.recParts[micId] = [];
+      this.link.send(mic.client, { t: 'measure', kind: 'raw', end });
+      const r = await this.waitFor(micId, end - hostNow() + 30000);
+      if (!r || r.t !== 'measureResult' || !r.raw) throw new Error('录音设备没有返回录音（请确认它已经刷新到新版本）');
+      const parts = this.recParts[micId] || [];
+      if (parts.length < r.raw.n || parts.some((p) => !p)) throw new Error('录音没有完整传回来，请再试一次');
+      const bins = parts.map((p) => atob(p)), total = bins.reduce((a, b) => a + b.length, 0), u8 = new Uint8Array(total);
+      { let o = 0; for (const b of bins) { for (let i = 0; i < b.length; i++) u8[o + i] = b.charCodeAt(i); o += b.length; } }
+      const pcm = new Int16Array(u8.buffer, 0, u8.length >> 1), x = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) x[i] = pcm[i] / 32768;
+      data = { rec: x, sr: r.raw.rate || 24000, startHost: r.raw.startHost, inLat: r.raw.inLat || 0 };
+    }
+    if (window.__smFakeMicAsync) data = await window.__smFakeMicAsync(data); // 自动测试用
+    return data;
+  },
+
+  // 量一轮：每台设备出声 reps 次（轮流、间隔 1 秒），返回每台“听到时刻 - 串流时间”（毫秒，只有彼此相比才有意义）
+  async measureStream(devs, micId, reps, out, label) {
+    await this.settle(out);
+    const mic = await this.openMic(micId);
+    const ld = H.liveDelay, GAP = 1500; // 1.5 秒一次：指纹 + 房间回音约 0.45 秒，各设备延迟差到 0.7 秒也不会互相重叠
+    // 每次出声的时间加上随机偏移：其他设备的声音就不会刚好排成和这台一样的节奏，被误认成这台（离麦克风近的设备可能大声十倍）
+    const T0 = hostNow() + 600, sched = [];
+    for (let r = 0; r < reps; r++) devs.forEach((d, i) => sched.push({ did: d.id, d, ts: T0 + (r * devs.length + i) * GAP + Math.random() * 300 }));
+    // 不猜每台什么时候会被听到：在“缓冲 - 0.3 秒”到“缓冲 + 1.8 秒”之间全部搜索（涵盖任何延迟微调和蓝牙延迟）
+    const lo = ld - 300, hi = ld + 1800;
+    const end = Math.max(...sched.map((x) => x.ts)) + hi + 250;
+    out(`🔊 ${label}：各设备轮流发出校准音（每台 ${reps} 次），请保持安静、不要移动设备…（约 ${Math.ceil((end - hostNow()) / 1000)} 秒）`);
+    let data;
+    this.calGen.setSched(sched);
+    try { data = await this.recordUntil(mic, micId, end); }
+    finally { this.calGen?.setSched([]); }
+    out('🧮 分析中…'); await sleep(30);
+    if (data.sr > 24000) data = { ...data, rec: toRate(data.rec, data.sr, 24000), sr: 24000 }; // 24kHz 分析就够（指纹只到 9kHz），计算量减半
+    const plans = devs.map((d, i) => ({ did: d.id, idx: i, ts: sched.filter((x) => x.did === d.id).map((x) => x.ts) }));
+    const res = findCodes(data, plans, lo, hi);
+    window.__smLastStream = res; window.__smStreamHist = [...(window.__smStreamHist || []).slice(-9), res]; // 排查用
+    return devs.map((d, i) => {
+      const f = res[i], heardR = f.reps.filter((x) => x.val !== null && x.ratio > 6);
+      const vals = heardR.map((x) => x.val), m = median(vals);
+      const close = vals.filter((v) => m !== null && Math.abs(v - m) <= 1);
+      // 4 次里至少 3 次互相吻合（1ms 内），而且梳状匹配的峰要明显、独一无二
+      const good = close.length >= Math.max(2, Math.ceil(reps * 0.75)) && f.clarity > 4 && f.unique < 0.8;
+      // 粗略值：梳状匹配很明确、但 4 次不够一致时（例如和别台的声音重叠），先拿来做第一次粗调，之后几轮再精修
+      const rough = !good && heardR.length >= 2 && f.clarity > 8 && f.unique < 0.6 ? m : null;
+      return { d, ok: good, rough, val: good ? close.reduce((a, v) => a + v, 0) / close.length : null, heard: heardR.length, of: reps, spread: close.length > 1 ? Math.max(...close) - Math.min(...close) : null, clarity: f.clarity, unique: f.unique, ratio: Math.max(0, ...f.reps.map((x) => x.ratio)) };
+    });
+  },
+
+  async streamCalibrate() {
+    if (this.calibrating) return;
+    const out = (h) => ($('#calibOut').innerHTML = h);
+    if (H.currentGroupId !== 'live') return this.calibrate(); // 不是实时音源：用原本的“啾”声校准
+    const micId = $('#calibMic').value;
+    const devs = Object.values(H.devices).filter((d) => d.online && (d.id !== 'self' || this.selfEngine));
+    if (!devs.length) return toast('还没有在线的播放设备');
+    if (micId !== 'self' && ![...this.link?.clients.values() || []].some((c) => c.did === micId)) return toast('选的录音设备不在线');
+    this.calibPrep();
+    this.calibrating = true; for (const b of ['#calibBtn', '#musicCalBtn', '#checkBtn']) $(b) && ($(b).disabled = true);
+    const r1 = (v) => Math.round(v * 10) / 10, r2 = (v) => Math.round(v * 100) / 100;
+    const before = Object.fromEntries(devs.map((d) => [d.id, d.latencyMs]));
+    const hist = []; // 每一轮：各设备之间最大差距
+    let rows = null, firstRows = null, done = false, stuck = false, warnLost = [];
+    try {
+      out('🎙 打开麦克风中…（如果弹出权限询问，请点“允许”）');
+      // 整个校准期间由校准串流接管（中间是静音），先送 1.5 秒让所有设备从音乐切换过来、稳定下来
+      this.calStreamStart(devs);
+      await sleep(1500);
+      for (let it = 1; it <= 6 && !done; it++) {
+        rows = await this.measureStream(devs, micId, 4, out, it === 1 ? '测量' : `调整后再量一次（第 ${it} 轮）`);
+        if (!firstRows) firstRows = rows;
+        let good = rows.filter((r) => r.ok);
+        warnLost = rows.filter((r) => !r.ok);
+        // 有设备只量到粗略值：这一轮不算数（不能当作验证），但先用粗略值把它拉近，下一轮再精确量
+        const rough = rows.filter((r) => !r.ok && r.rough !== null);
+        if (rough.length && good.length + rough.length >= 2) {
+          const all = [...good.map((r) => [r, r.val]), ...rough.map((r) => [r, r.rough])];
+          const E0 = Math.max(...all.map((x) => x[1]));
+          hist.push(E0 - Math.min(...all.map((x) => x[1])));
+          const nl = new Map(all.map(([r, v]) => [r.d, r.d.latencyMs + (E0 - v)])), mn = Math.min(...nl.values());
+          for (const [d, v] of nl) d.latencyMs = r2(Math.max(0, Math.min(1000, v - mn)));
+          this.changed(); this.lastWire = ''; this.publish();
+          out('⏳ 先粗调，等各设备套用新设置…'); await sleep(3000);
+          continue;
+        }
+        if (good.length < 2) break;
+        const E = Math.max(...good.map((r) => r.val)), spread = E - Math.min(...good.map((r) => r.val));
+        hist.push(spread);
+        // 记录真实延迟（给画面同步用）：听到时刻 - 串流时间 - 缓冲 - 排定的延迟
+        const pm = this.plans();
+        for (const r of good) r.d.realLat = r1(r.val - H.liveDelay - this.totalD(r.d, pm));
+        if (spread <= 0.5) { done = true; break; }
+        // 连续三轮都没有变好（而且还差 2ms 以上）：设备可能没有照新的微调出声，停下来回报
+        if (hist.length >= 4 && hist.slice(-3).every((v, k, a) => k === 0 || v > a[k - 1] * 0.8) && hist[hist.length - 1] > 2) { stuck = true; break; }
+        // 以最晚的那台为准，其他设备各自延后“比它早多少”
+        const nl = new Map(good.map((r) => [r.d, r.d.latencyMs + (E - r.val)]));
+        const mn = Math.min(...nl.values());
+        for (const [d, v] of nl) d.latencyMs = r2(Math.max(0, Math.min(1000, v - mn)));
+        this.changed(); this.lastWire = ''; this.publish();
+        out('⏳ 已调整，等各设备套用新设置…');
+        await sleep(3000);
+      }
+      const name = (d) => esc(d.name);
+      const first = firstRows || [], firstGood = first.filter((r) => r.ok);
+      const fE = firstGood.length ? Math.max(...firstGood.map((r) => r.val)) : 0;
+      const last = new Map((rows || []).map((r) => [r.d, r]));
+      const lE = rows ? Math.max(...rows.filter((r) => r.ok).map((r) => r.val), -Infinity) : 0;
+      const why = (r) => r.heard === 0
+        ? '没录到它的声音：确认它有在播放（没静音、音量够大），离麦克风近一点'
+        : `只听清楚 ${r.heard}/${r.of} 次（清晰度 ${r.clarity.toFixed(1)}）：周围太吵或回音太大，靠近一点再试`;
+      const table = `<table class="small" style="width:100%;margin-top:6px"><tr class="muted"><td>设备</td><td>校准前</td><td>校准后</td><td>微调</td></tr>${devs.map((d) => {
+        const f = first.find((r) => r.d === d), l = last.get(d);
+        const pre = f?.ok ? `${(fE - f.val) < 0.05 ? '最晚的那台' : `早 ${(fE - f.val).toFixed(1)} ms`}` : '—';
+        const post = l?.ok ? `${Math.abs(lE - l.val) <= 0.5 ? '✅' : '🔧'} ${(lE - l.val).toFixed(2)} ms` : `<span style="color:var(--bad)">没听到</span><div class="muted">${why(l || f)}</div>`;
+        return `<tr><td>${name(d)}</td><td>${pre}</td><td>${post}${l?.spread != null ? `<div class="muted">4 次测量相差 ${l.spread.toFixed(2)} ms</div>` : ''}</td><td class="muted">${before[d.id]} → ${d.latencyMs} ms</td></tr>`;
+      }).join('')}</table>`;
+      const trend = hist.length ? `<div class="muted">每一轮各设备之间最大差距：${hist.map((v) => v.toFixed(2) + ' ms').join(' → ')}</div>` : '';
+      if (done) {
+        out(`✅ 校准完成：实际量到各设备之间最多差 <b>${hist[hist.length - 1].toFixed(2)} ms</b>${hist.length > 1 ? '（调整后重新量过确认）' : '（本来就已经对齐）'}${warnLost.length ? `，但 ${warnLost.map((r) => name(r.d)).join('、')} 没听到，没有调整它` : ''}
+          ${table}${trend}<div class="muted" style="margin-top:4px">测的是“啾”声走跟音乐完全一样的路，在麦克风位置听到的时间。请在麦克风的位置听（声音每 1 ms 走 34 cm）。</div>`);
+        $('#calibUndo').hidden = false; this.calUndo = before;
+      } else if (stuck) {
+        out(`⚠️ 调整了但没有变化，可能有设备没有套用新设置。${table}${trend}<div class="muted">请截图给我。</div>`);
+        this.calUndo = before; $('#calibUndo').hidden = false;
+      } else if (hist.length) {
+        out(`⚠️ 调了 ${hist.length} 轮还没收敛到 0.5 ms 内（目前最多差 ${hist[hist.length - 1].toFixed(2)} ms）。${table}${trend}<div class="muted">可以再按一次继续；如果每次都差很多，请截图给我。</div>`);
+        this.calUndo = before; $('#calibUndo').hidden = false;
+      } else {
+        out(`⚠️ 需要至少两台设备被听清楚才能对齐。${table}`);
+      }
+      this.changed();
+    } catch (e) {
+      out('❌ ' + esc(e.message || String(e)));
+    } finally {
+      this.calStreamStop();
+      this.calibrating = false; for (const b of ['#calibBtn', '#musicCalBtn', '#checkBtn']) $(b) && ($(b).disabled = false);
+    }
+  },
+
   // 一个按钮：有音乐在播就用音乐校准（最准，测的就是你听到的），没有就用“啾”声
   async smartCalibrate() {
+    return this.streamCalibrate();
+  },
+  async smartCalibrateOld() {
     if (this.group()?.kind === 'live' && this.live.running) {
       // 最近 3 秒真的有声音才用音乐校准（暂停中/安静段落用音乐一定比对不上）
       const ring = (this.srcRing || []).slice(-150);

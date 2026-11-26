@@ -7,7 +7,7 @@ const CHIRP_SEC = 0.05;
 // 宽频“啾”：1kHz → 12kHz。频带越宽，峰越尖，定位越准（手机小喇叭也放得出来）
 export function makeChirp(sr) {
   const n = Math.round(sr * CHIRP_SEC), out = new Float32Array(n);
-  const f0 = 1000, f1 = Math.min(12000, sr * 0.45), T = CHIRP_SEC;
+  const f0 = 1000, f1 = Math.min(10800, sr * 0.45), T = CHIRP_SEC; // 上限 10.8kHz：48k 播放、24k 录音时的形状完全一样
   for (let i = 0; i < n; i++) {
     const t = i / sr;
     const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)); // Hann 窗
@@ -389,4 +389,84 @@ export function profileFromBands(bands) {
     level: Math.round(mid * 10) / 10,
     measured: true,
   };
+}
+
+// ================= 新校准：每台设备专属的“声音指纹” =================
+// 每台设备一段不同的随机噪声（500–9000Hz，0.2 秒），彼此几乎不相关 → 录音里谁是谁不会搞混。
+// 用频率定义（不是采样点），所以 48k 播放、24k 录音生成的形状完全一样。
+const CODE_SEC = 0.2, CODE_F0 = 500, CODE_F1 = 9000;
+const codeCache = new Map();
+export function makeCode(idx, sr) {
+  const key = idx + '@' + sr; if (codeCache.has(key)) return codeCache.get(key);
+  let s = (idx * 7919 + 12345) >>> 0; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+  const n = Math.round(sr * CODE_SEC), out = new Float32Array(n), df = 1 / CODE_SEC;
+  for (let f = CODE_F0; f <= CODE_F1; f += df) {
+    const ph = rnd() * 2 * Math.PI, w = (2 * Math.PI * f) / sr;
+    // 递推产生 cos(w·i + ph)，比每点算 cos 快很多
+    let c = Math.cos(ph), sn = Math.sin(ph); const cw = Math.cos(w), sw = Math.sin(w);
+    for (let i = 0; i < n; i++) { out[i] += c; const c2 = c * cw - sn * sw; sn = sn * cw + c * sw; c = c2; }
+  }
+  let pk = 0;
+  for (let i = 0; i < n; i++) { const win = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)); out[i] *= win; pk = Math.max(pk, Math.abs(out[i])); }
+  for (let i = 0; i < n; i++) out[i] /= pk;
+  codeCache.set(key, out); return out;
+}
+
+// 在整段录音里找每台设备的指纹。不需要猜它什么时候会出现：
+// 每台设备在串流时间 ts[k] 各放一次，听到的时刻 = ts[k] + c（c 对同一台设备是固定的）。
+// 把 lo~hi 之间所有可能的 c 都试一次，看哪个 c 能让所有 ts[k] 同时对到峰（梳状匹配），再逐次精确到零点几个采样点。
+// plans: [{ did, idx, ts: [...] }]；返回每台 { did, c, clarity, unique, reps: [{ val, ratio }] }（val = 听到时刻 - ts，毫秒）
+export function findCodes({ rec, sr, startHost, inLat = 0 }, plans, lo, hi) {
+  const m = Math.round(sr * CODE_SEC);
+  let N = 1; while (N < rec.length + m) N <<= 1;
+  const fft = new FFT(N);
+  const yr = new Float64Array(N), yi = new Float64Array(N);
+  for (let i = 0; i < rec.length; i++) yr[i] = rec[i];
+  fft.run(yr, yi, false);
+  const toIdx = (t) => ((t - startHost + inLat * 1000) / 1000) * sr;
+  const toT = (i) => startHost + (i / sr) * 1000 - inLat * 1000;
+  const B = Math.max(1, Math.round(sr * 0.0005)); // 粗网格：0.5ms
+  return plans.map((p) => {
+    const tpl = makeCode(p.idx, sr), xr = new Float64Array(N), xi = new Float64Array(N);
+    for (let i = 0; i < m; i++) xr[i] = tpl[i];
+    fft.run(xr, xi, false);
+    // Y × conj(X)，只留正频率 → 反变换取模 = 互相关的包络（不会因为正负号跳半个周期）
+    for (let k = 0; k < N; k++) {
+      if (k > N / 2) { xr[k] = 0; xi[k] = 0; continue; }
+      const a = yr[k], b = yi[k], c = xr[k], d = -xi[k], w = k === 0 || k === N / 2 ? 1 : 2;
+      xr[k] = (a * c - b * d) * w; xi[k] = (a * d + b * c) * w;
+    }
+    fft.run(xr, xi, true);
+    const L = rec.length, env = new Float32Array(L);
+    for (let i = 0; i < L; i++) env[i] = Math.hypot(xr[i], xi[i]);
+    const nb = Math.ceil(L / B), coarse = new Float32Array(nb);
+    for (let i = 0; i < L; i++) { const b = (i / B) | 0; if (env[i] > coarse[b]) coarse[b] = env[i]; }
+    const noise = (() => { const s = Array.from(coarse).sort((a, b) => a - b); return s[s.length >> 1] || 1e-12; })();
+    const at = (t) => { const b = Math.round(toIdx(t) / B); if (b < 1 || b >= nb - 1) return 0; return Math.max(coarse[b - 1], coarse[b], coarse[b + 1]); };
+    // 梳状匹配：每个候选 c 的分数 = 所有次数在 ts[k]+c 的峰值之和（用 min 和 sum 的组合：每一次都要有，才算数）
+    const cands = [];
+    for (let c = lo; c <= hi; c += 0.5) {
+      let sum = 0, mn = Infinity;
+      for (const ts of p.ts) { const v = at(ts + c); sum += v; if (v < mn) mn = v; }
+      cands.push([c, sum + mn * p.ts.length]);
+    }
+    let best = cands[0]; for (const q of cands) if (q[1] > best[1]) best = q;
+    // 第二高的候选（离最佳 60ms 以外；墙壁反射只会在 0–30ms 内造成次峰，那不算模糊）
+    let second = 0; for (const q of cands) if (Math.abs(q[0] - best[0]) > 60 && q[1] > second) second = q[1];
+    const sc = cands.map((q) => q[1]).sort((a, b) => a - b), med = sc[sc.length >> 1] || 1e-12;
+    // 逐次精确定位：在 ts[k]+c 附近 ±2ms 找最高峰，再往前 4ms 找“最早到达”的直达声（后面的是反射）
+    const reps = p.ts.map((ts) => {
+      const ctr = Math.round(toIdx(ts + best[0])), w2 = Math.round(sr * 0.002);
+      let bi = -1, bv = 0;
+      for (let i = Math.max(1, ctr - w2); i <= Math.min(L - 2, ctr + w2); i++) if (env[i] > bv) { bv = env[i]; bi = i; }
+      if (bi < 0) return { val: null, ratio: 0 };
+      let pk = bi;
+      for (let i = Math.max(1, bi - Math.round(sr * 0.004)); i < bi; i++) if (env[i] >= bv * 0.6 && env[i] >= env[i - 1] && env[i] >= env[i + 1]) { pk = i; break; }
+      const y0 = env[pk - 1], y1 = env[pk], y2 = env[pk + 1], den = y0 - 2 * y1 + y2;
+      const fr = den ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
+      return { val: toT(pk + fr) - ts, ratio: y1 / noise };
+    });
+    let secondC = null; for (const q of cands) if (Math.abs(q[0] - best[0]) > 60 && q[1] === second) secondC = q[0];
+    return { did: p.did, c: best[0], secondC, clarity: best[1] / med, unique: second / best[1], reps };
+  });
 }

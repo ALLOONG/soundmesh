@@ -624,8 +624,14 @@ export class Engine extends EventTarget {
     const ema = this.liveErr || (this.liveErr = new Map());
     let planes = []; for (let c = 0; c < ch; c++) planes.push(buffer.getChannelData(c).slice());
     const cursor = curs.get(srcName) ?? null, gap = cursor === null ? null : expF - cursor;
+    // 这台设备自己的排定延迟（延迟微调、位置）改变超过 2ms：直接跳到新位置，不要慢慢滑
+    // （慢慢滑每秒只追 3ms，校准改了 200ms 要一分多钟才到位——这段时间量到的都是“移动中”的结果）。
+    // 缓冲（所有设备一起）自动微调时照旧慢慢滑，听不出来
+    const tgt = cur.plan.D, tg = this.liveTgt || (this.liveTgt = new Map()), prevT = tg.get(srcName);
+    tg.set(srcName, tgt);
+    const jump = prevT !== undefined && Math.abs(tgt - prevT) > 2;
     let startF, fadeIn = 0;
-    if (cursor === null || cursor < minF || gap < -0.04 * sr || gap > 0.25 * sr) {
+    if (cursor === null || jump || cursor < minF || gap < -0.04 * sr || gap > 0.25 * sr) {
       // 重新对齐（刚开始 / 网络卡太久之后 / 误差太大）：旧的在接点淡出，新的淡入
       startF = Math.max(expF, minF);
       if (cursor !== null) { p.port.postMessage({ cut: startF, fade: 192 }); this.liveStats.resyncs++; }
